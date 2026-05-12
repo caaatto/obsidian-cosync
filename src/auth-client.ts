@@ -34,9 +34,18 @@ async function postJson(url: string, body: object): Promise<{ status: number; js
   return { status: res.status, json };
 }
 
-export async function register(serverUrl: string, username: string, password: string): Promise<{ ok: boolean; status: number; error?: string }> {
+export async function register(
+  serverUrl: string,
+  username: string,
+  password: string,
+  inviteCode: string,
+): Promise<{ ok: boolean; status: number; error?: string }> {
   try {
-    const { status, json } = await postJson(`${httpBase(serverUrl)}/auth/register`, { username, password });
+    const { status, json } = await postJson(`${httpBase(serverUrl)}/auth/register`, {
+      username,
+      password,
+      inviteCode,
+    });
     if (status === 201) return { ok: true, status };
     return { ok: false, status, error: json?.error || `register failed (${status})` };
   } catch (e: any) {

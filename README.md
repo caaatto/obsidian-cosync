@@ -27,15 +27,18 @@ Im neuen Settings-Tab "CoSync" eintragen:
 |---|---|
 | **Enabled** | an |
 | **Server URL** | bekommst du vom Server-Admin (`wss://…`) |
-| **Username** | dein Login. Der Server-Admin muss dich vorher auf die Whitelist setzen. |
+| **Username** | dein Login — den Namen vereinbarst du vorher mit dem Server-Admin |
 | **Password** | min. 8 Zeichen, du wählst frei |
+| **Invite code** | einmaliger Code vom Server-Admin (nur bei der allerersten Registrierung nötig) |
 | **Display name** | optional — wie du an deinem Cursor erscheinst |
 | **Cursor color** | freie Wahl |
 | **Vault ID** | bekommst du vom Server-Admin — alle, die den gleichen Wert eintragen, syncen denselben Vault |
 
-**Erste Anmeldung:** „Register" klicken — legt den Account an und loggt direkt ein.
-Bei jedem späteren Obsidian-Start verbindet sich das Plugin automatisch mit dem
-gespeicherten Session-Token (90 Tage gültig, danach neu einloggen).
+**Erste Anmeldung:** Invite-Code eintragen, dann „Register" klicken — legt den
+Account an und loggt direkt ein. Der Code ist danach verbraucht. Bei späteren
+Logins reicht Username + Passwort, der Code wird nicht mehr gebraucht.
+
+Sessions sind 90 Tage gültig; nach Ablauf einfach erneut „Login".
 
 ## Bedienung
 

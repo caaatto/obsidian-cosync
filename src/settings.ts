@@ -4,8 +4,9 @@ import { effectiveDisplayName, isLoggedIn } from './types';
 import { login, logout, register } from './auth-client';
 
 export class CoSyncSettingTab extends PluginSettingTab {
-  // Password is held in-memory only; never persisted via saveSettings().
+  // Password and invite code are held in-memory only; never persisted via saveSettings().
   private pendingPassword = '';
+  private pendingInviteCode = '';
 
   constructor(app: App, private plugin: CoSyncPlugin) {
     super(app, plugin);
@@ -69,8 +70,16 @@ export class CoSyncSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
+      .setName('Invite code (only for first registration)')
+      .setDesc('You receive a one-time code from the server admin. Required to create the account, not needed for login.')
+      .addText((t) => {
+        t.setPlaceholder('e.g. A1B2C3D4E5F6A1B2');
+        t.onChange((v) => { this.pendingInviteCode = v.trim(); });
+      });
+
+    new Setting(containerEl)
       .setName('Login / Register')
-      .setDesc('Login uses an existing account. Register creates a new one (server-whitelist required).')
+      .setDesc('Login uses an existing account. Register creates a new one (invite code required).')
       .addButton((b) => b.setButtonText('Login').setCta().onClick(async () => {
         await this.doLogin();
       }))
@@ -155,11 +164,16 @@ export class CoSyncSettingTab extends PluginSettingTab {
       new Notice('CoSync: server URL, username and password required.');
       return;
     }
-    const res = await register(s.serverUrl, s.username, this.pendingPassword);
+    if (!this.pendingInviteCode) {
+      new Notice('CoSync: invite code required for registration.');
+      return;
+    }
+    const res = await register(s.serverUrl, s.username, this.pendingPassword, this.pendingInviteCode);
     if (!res.ok) {
       new Notice(`CoSync: register failed — ${res.error}`);
       return;
     }
+    this.pendingInviteCode = '';
     new Notice('CoSync: account created. Logging in…');
     await this.doLogin();
   }
