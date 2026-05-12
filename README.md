@@ -44,6 +44,10 @@ Sessions sind 90 Tage gültig; nach Ablauf einfach erneut „Login".
 
 - Datei öffnen → Verbindung wird aufgebaut, Cursor der anderen werden sichtbar.
 - Tippen → live bei allen anderen.
+- **Neue Dateien** erscheinen bei den anderen automatisch als leere Stubs; der
+  Inhalt füllt sich, sobald sie die Datei öffnen.
+- **Umbenennen** wird propagiert. **Löschen** wird bewusst NICHT geteilt — jeder
+  räumt seinen Vault selbst auf, damit niemandem versehentlich Notizen verschwinden.
 - Offline arbeiten → läuft weiter (lokaler IndexedDB-Cache); beim Reconnect wird
   automatisch zusammengeführt.
 

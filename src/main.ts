@@ -1,11 +1,13 @@
 import { MarkdownView, Plugin, TFile, WorkspaceLeaf } from 'obsidian';
 import { CoSyncSettingTab } from './settings';
 import { SyncManager } from './sync';
+import { VaultIndexSync } from './vault-index';
 import { CoSyncSettings, DEFAULT_SETTINGS, effectiveToken } from './types';
 
 export default class CoSyncPlugin extends Plugin {
   settings!: CoSyncSettings;
   sync: SyncManager | null = null;
+  vaultIndex: VaultIndexSync | null = null;
 
   async onload() {
     await this.loadSettings();
@@ -17,7 +19,7 @@ export default class CoSyncPlugin extends Plugin {
 
     this.addSettingTab(new CoSyncSettingTab(this.app, this));
 
-    this.startSyncIfConfigured();
+    await this.startSyncIfConfigured();
 
     this.registerEvent(this.app.workspace.on('file-open', this.handleFileOpen.bind(this)));
     this.registerEvent(this.app.workspace.on('active-leaf-change', this.handleLeafChange.bind(this)));
@@ -26,6 +28,10 @@ export default class CoSyncPlugin extends Plugin {
   }
 
   async onunload() {
+    if (this.vaultIndex) {
+      await this.vaultIndex.stop();
+      this.vaultIndex = null;
+    }
     if (this.sync) {
       await this.sync.closeAll();
       this.sync = null;
@@ -38,16 +44,20 @@ export default class CoSyncPlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
-    // Restart the sync manager so the new settings take effect.
+    // Restart the sync managers so the new settings take effect.
+    if (this.vaultIndex) {
+      await this.vaultIndex.stop();
+      this.vaultIndex = null;
+    }
     if (this.sync) {
       await this.sync.closeAll();
       this.sync = null;
     }
-    this.startSyncIfConfigured();
+    await this.startSyncIfConfigured();
     this.bindCurrentLeaf();
   }
 
-  private startSyncIfConfigured() {
+  private async startSyncIfConfigured() {
     if (!this.settings.enabled) {
       console.log('[cosync] disabled in settings');
       return;
@@ -60,7 +70,17 @@ export default class CoSyncPlugin extends Plugin {
       console.warn('[cosync] not started: log in via plugin settings first');
       return;
     }
+    if (!this.settings.vaultId) {
+      console.warn('[cosync] not started: vault id missing');
+      return;
+    }
     this.sync = new SyncManager(this.app, this.settings);
+    this.vaultIndex = new VaultIndexSync(this.app, this.settings);
+    try {
+      await this.vaultIndex.start();
+    } catch (e) {
+      console.error('[cosync] vault index sync failed to start', e);
+    }
   }
 
   private async handleFileOpen(file: TFile | null) {
