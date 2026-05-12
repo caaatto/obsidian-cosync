@@ -1,0 +1,46 @@
+/* obsidian-cosync — remote cursors / selections from y-codemirror.next */
+
+.cm-ySelection {
+  background-color: rgba(127, 127, 127, 0.18);
+}
+
+.cm-yLineSelection {
+  background-color: rgba(127, 127, 127, 0.08);
+}
+
+.cm-ySelectionCaret {
+  position: relative;
+  border-left: 2px solid currentColor;
+  border-right: none;
+  height: 1.2em;
+  margin-left: -1px;
+  margin-right: -1px;
+  box-sizing: border-box;
+  display: inline-block;
+}
+
+.cm-ySelectionCaretDot {
+  display: none;
+}
+
+.cm-ySelectionInfo {
+  position: absolute;
+  top: -1.1em;
+  left: -1px;
+  font-size: 10px;
+  font-family: var(--font-interface);
+  color: white;
+  padding: 1px 4px;
+  border-radius: 3px;
+  white-space: nowrap;
+  user-select: none;
+  pointer-events: none;
+  background-color: currentColor;
+  opacity: 0.95;
+  z-index: 1000;
+}
+
+.cm-ySelectionInfo > * {
+  color: white;
+  filter: none;
+}
