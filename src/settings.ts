@@ -1,7 +1,7 @@
 import { App, Modal, Notice, PluginSettingTab, Setting } from 'obsidian';
 import type CoSyncPlugin from './main';
 import { LOCAL_VAULT_ID, isLoggedIn } from './types';
-import { login, logout, register } from './auth-client';
+import { login, logout, register, updateProfile } from './auth-client';
 
 export class CoSyncSettingTab extends PluginSettingTab {
   // Password and invite code are held in-memory only; never persisted via saveSettings().
@@ -11,6 +11,9 @@ export class CoSyncSettingTab extends PluginSettingTab {
   // Add-vault form state, held until the user clicks "Add".
   private newVaultName = '';
   private newVaultId = '';
+
+  // Debounce timer for pushing profile (display name / color) edits to the server.
+  private profilePushTimer?: ReturnType<typeof setTimeout>;
 
   constructor(app: App, private plugin: CoSyncPlugin) {
     super(app, plugin);
@@ -112,22 +115,25 @@ export class CoSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Display name')
-      .setDesc(`Shown to others as your cursor label. Defaults to "${this.plugin.settings.username || 'your username'}".`)
+      .setDesc(`Shown to others as your cursor label. Synced with your account when logged in.`)
       .addText((t) => t
         .setPlaceholder(this.plugin.settings.username || 'anon')
         .setValue(this.plugin.settings.displayName)
         .onChange(async (v) => {
           this.plugin.settings.displayName = v;
           await this.plugin.saveSettings();
+          this.schedulePushProfile();
         }));
 
     new Setting(containerEl)
       .setName('Cursor color')
+      .setDesc('Synced with your account when logged in.')
       .addColorPicker((c) => c
         .setValue(this.plugin.settings.userColor)
         .onChange(async (v) => {
           this.plugin.settings.userColor = v;
           await this.plugin.saveSettings();
+          this.schedulePushProfile();
         }));
 
     // ── Vaults ──────────────────────────────────────────────────────
@@ -270,10 +276,34 @@ export class CoSyncSettingTab extends PluginSettingTab {
     s.sessionToken = res.token;
     s.sessionExpiresAt = res.expiresAt;
     s.username = res.username;
+    // Server is authoritative for display name + color; adopt what it returned.
+    s.displayName = res.displayName;
+    s.userColor = res.color;
     this.pendingPassword = '';
     await this.plugin.saveSettings();
     new Notice(`CoSync: logged in as ${res.username} (effective until ${new Date(res.expiresAt).toLocaleDateString()})`);
     this.display();
+  }
+
+  private schedulePushProfile() {
+    if (this.profilePushTimer) clearTimeout(this.profilePushTimer);
+    this.profilePushTimer = setTimeout(() => { void this.pushProfile(); }, 800);
+  }
+
+  private async pushProfile() {
+    const s = this.plugin.settings;
+    if (!isLoggedIn(s) || !s.serverUrl) return;
+    const res = await updateProfile(s.serverUrl, s.sessionToken, s.displayName || s.username, s.userColor);
+    if (!res.ok) {
+      console.warn('[cosync] profile push failed', res);
+      return;
+    }
+    // Normalize back from server (e.g. color casing, name trimming).
+    if (s.displayName !== res.displayName || s.userColor !== res.color) {
+      s.displayName = res.displayName;
+      s.userColor = res.color;
+      await this.plugin.saveSettings();
+    }
   }
 
   private async doRegister() {
@@ -286,7 +316,14 @@ export class CoSyncSettingTab extends PluginSettingTab {
       new Notice('CoSync: invite code required for registration.');
       return;
     }
-    const res = await register(s.serverUrl, s.username, this.pendingPassword, this.pendingInviteCode);
+    const res = await register(
+      s.serverUrl,
+      s.username,
+      this.pendingPassword,
+      this.pendingInviteCode,
+      s.displayName || s.username,
+      s.userColor,
+    );
     if (!res.ok) {
       new Notice(`CoSync: register failed - ${res.error}`);
       return;

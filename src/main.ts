@@ -1,4 +1,4 @@
-import { MarkdownView, Notice, Plugin, TFile, WorkspaceLeaf, normalizePath } from 'obsidian';
+import { App, MarkdownView, Modal, Notice, Plugin, TFile, WorkspaceLeaf, normalizePath } from 'obsidian';
 import { CoSyncSettingTab } from './settings';
 import { SyncManager } from './sync';
 import { VaultIndexSync } from './vault-index';
@@ -24,6 +24,16 @@ export default class CoSyncPlugin extends Plugin {
     }
 
     this.addSettingTab(new CoSyncSettingTab(this.app, this));
+
+    this.addRibbonIcon('users', 'CoSync: switch vault', () => {
+      new VaultSwitcherModal(this.app, this).open();
+    });
+
+    this.addCommand({
+      id: 'switch-vault',
+      name: 'Switch active vault',
+      callback: () => new VaultSwitcherModal(this.app, this).open(),
+    });
 
     await this.startSyncIfConfigured();
 
@@ -285,5 +295,73 @@ export default class CoSyncPlugin extends Plugin {
     for (const f of files) await adapter.remove(f);
     for (const sub of folders) await this.removeDirRecursive(sub);
     try { await (adapter as unknown as { rmdir: (p: string) => Promise<void> }).rmdir(dir); } catch { /* ignore */ }
+  }
+}
+
+class VaultSwitcherModal extends Modal {
+  private selectedId: string;
+
+  constructor(app: App, private plugin: CoSyncPlugin) {
+    super(app);
+    this.selectedId = plugin.settings.vaultId;
+  }
+
+  onOpen() {
+    this.titleEl.setText('CoSync: switch vault');
+    const { contentEl } = this;
+
+    contentEl.createEl('p', {
+      text: 'Pick a vault and click Switch. The current .md files will be cached, the target vault\'s files restored.',
+      cls: 'setting-item-description',
+    });
+
+    const list = contentEl.createDiv({ cls: 'cosync-vault-switcher' });
+    for (const v of this.plugin.settings.savedVaults) {
+      const isActive = v.id === this.plugin.settings.vaultId;
+      const row = list.createDiv({ cls: 'cosync-vault-switcher-row' });
+      row.style.display = 'flex';
+      row.style.alignItems = 'center';
+      row.style.gap = '0.5rem';
+      row.style.padding = '0.25rem 0';
+      row.style.cursor = 'pointer';
+
+      const radio = row.createEl('input', { type: 'radio' });
+      radio.name = 'cosync-vault';
+      radio.value = v.id;
+      radio.checked = (v.id === this.selectedId);
+
+      const label = row.createEl('span');
+      let labelText = v.name;
+      if (v.id === LOCAL_VAULT_ID) labelText += ' (offline)';
+      if (isActive) labelText += ' [active]';
+      label.setText(labelText);
+
+      const select = () => {
+        this.selectedId = v.id;
+        const radios = list.querySelectorAll<HTMLInputElement>('input[type="radio"]');
+        radios.forEach((r) => { r.checked = (r.value === v.id); });
+      };
+      radio.addEventListener('change', select);
+      row.addEventListener('click', (e) => { if (e.target !== radio) select(); });
+    }
+
+    const btns = contentEl.createDiv({ cls: 'modal-button-container' });
+    const cancel = btns.createEl('button', { text: 'Cancel' });
+    cancel.onclick = () => this.close();
+    const ok = btns.createEl('button', { text: 'Switch', cls: 'mod-cta' });
+    ok.onclick = async () => {
+      const target = this.selectedId;
+      this.close();
+      if (target === this.plugin.settings.vaultId) return;
+      try {
+        await this.plugin.switchVault(target);
+      } catch (e: any) {
+        new Notice(`CoSync: switch failed - ${e?.message || e}`);
+      }
+    };
+  }
+
+  onClose() {
+    this.contentEl.empty();
   }
 }
