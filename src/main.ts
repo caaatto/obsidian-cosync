@@ -15,6 +15,18 @@ import {
   migrateSettings,
 } from './types';
 
+/**
+ * Global handle used to detect duplicate plugin loads. BRAT's "check for
+ * updates on startup" can load a newer build of the plugin without first
+ * calling onunload() on the previous instance, which leaves two SyncManagers
+ * fighting over the same EditorView - the symptom users see is "sync works
+ * on the first file but breaks the moment I switch notes" plus a
+ * "Yjs was already imported" console warning.
+ *
+ * Stored on globalThis so it survives module re-evaluation.
+ */
+const COSYNC_PLUGIN_GLOBAL_KEY = '__cosync_active_plugin_instance__';
+
 export default class CoSyncPlugin extends Plugin {
   settings!: CoSyncSettings;
   sync: SyncManager | null = null;
@@ -31,6 +43,22 @@ export default class CoSyncPlugin extends Plugin {
   private currentActiveFile: string | null = null;
 
   async onload() {
+    // Defensive: if a previous plugin instance is still mounted in this
+    // Obsidian process (e.g. because BRAT hot-loaded a new bundle without
+    // disabling the old one first), forcibly unload it before we set up.
+    // Otherwise two SyncManagers race for the same EditorView and live
+    // sync breaks as soon as you switch notes.
+    const previous = (globalThis as Record<string, unknown>)[COSYNC_PLUGIN_GLOBAL_KEY];
+    if (previous && previous !== this && typeof (previous as { onunload?: unknown }).onunload === 'function') {
+      console.warn('[cosync] previous plugin instance detected; unloading it before initializing this one');
+      try {
+        await (previous as { onunload: () => Promise<void> | void }).onunload();
+      } catch (e) {
+        console.error('[cosync] previous instance unload failed', e);
+      }
+    }
+    (globalThis as Record<string, unknown>)[COSYNC_PLUGIN_GLOBAL_KEY] = this;
+
     await this.loadSettings();
 
     if (migrateSettings(this.settings)) {
@@ -94,6 +122,8 @@ export default class CoSyncPlugin extends Plugin {
     await this.stopSync();
     document.querySelectorAll('.cosync-file-presence').forEach((el) => el.remove());
     document.body.style.removeProperty('--cosync-self-cursor-color');
+    const g = globalThis as Record<string, unknown>;
+    if (g[COSYNC_PLUGIN_GLOBAL_KEY] === this) delete g[COSYNC_PLUGIN_GLOBAL_KEY];
   }
 
   async loadSettings() {
