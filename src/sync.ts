@@ -241,10 +241,15 @@ export class SyncManager {
     }
   }
 
-  /** Set the CSS variable that drives the native caret color (see styles.css). */
+  /**
+   * Set the CSS variable that drives the native caret color (see styles.css).
+   * Also writes to document.body so every open editor inherits the same
+   * value, not just the one we are currently binding.
+   */
   private applySelfCursorColor(cm: EditorView): void {
     const color = this.settings.userColor || '#3eb6f7';
     cm.dom.style.setProperty('--cosync-self-cursor-color', color);
+    document.body.style.setProperty('--cosync-self-cursor-color', color);
   }
 
   /**

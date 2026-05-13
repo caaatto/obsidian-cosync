@@ -45,6 +45,10 @@ export default class CoSyncPlugin extends Plugin {
     this.statusBarEl.onclick = () => this.showPresencePopup();
     this.renderPresence();
 
+    // Apply self caret color globally so every editor pane (not just the
+    // active one) shows the user's chosen color, even before they focus it.
+    document.body.style.setProperty('--cosync-self-cursor-color', this.settings.userColor || '#3eb6f7');
+
     this.addRibbonIcon('users', 'CoSync: switch vault', () => {
       new VaultSwitcherModal(this.app, this).open();
     });
@@ -89,6 +93,7 @@ export default class CoSyncPlugin extends Plugin {
   async onunload() {
     await this.stopSync();
     document.querySelectorAll('.cosync-file-presence').forEach((el) => el.remove());
+    document.body.style.removeProperty('--cosync-self-cursor-color');
   }
 
   async loadSettings() {
@@ -112,9 +117,9 @@ export default class CoSyncPlugin extends Plugin {
     this.sync?.updateAwarenessIdentity();
     this.vaultIndex?.updateLocalUser();
     this.renderPresence();
-    // Re-binding the current leaf is a no-op for yCollab (boundDoc check
-    // short-circuits) but it does re-apply the self-caret CSS variable.
-    this.bindCurrentLeaf();
+    // Push the new color onto document.body so every open editor's caret
+    // updates immediately (CSS variable inheritance).
+    document.body.style.setProperty('--cosync-self-cursor-color', this.settings.userColor || '#3eb6f7');
   }
 
   private async stopSync() {

@@ -53,10 +53,19 @@
  * "your color" matches across the file-explorer dots, the awareness status
  * bar, and your own caret in the editor.
  *
+ * In CodeMirror 6 the primary caret is the native browser caret in the
+ * contenteditable .cm-content - its color is controlled by `caret-color`,
+ * NOT by any .cm-cursor element. The .cm-cursor element only exists for
+ * additional cursors when drawSelection draws them as decorations.
+ *
  * The CSS variable is set on the CodeMirror root element by sync.ts in
  * bindEditor; if no editor on this page has set it, the rule falls back
  * to the default Obsidian caret color.
  */
+.cm-editor .cm-content {
+  caret-color: var(--cosync-self-cursor-color, var(--text-normal)) !important;
+}
+
 .cm-editor .cm-cursor,
 .cm-editor .cm-cursor-primary {
   border-left-color: var(--cosync-self-cursor-color, var(--text-normal)) !important;
