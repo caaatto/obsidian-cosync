@@ -152,6 +152,63 @@ export class SyncManager {
     this.editorBoundRoom.set(cm, entry.room);
   }
 
+  /**
+   * Make sure every local .md has its content on the server. For files that
+   * have not been opened in this session (and so have no live room), open a
+   * short-lived room, seed Y.Text from disk if it is empty, then close it
+   * again. Files whose room is already live are skipped.
+   */
+  async eagerPushAllFiles(): Promise<void> {
+    const wsUrl = this.settings.serverUrl.replace(/\/+$/, '');
+    const token = effectiveToken(this.settings);
+    if (!token) return;
+
+    const files = this.app.vault.getMarkdownFiles();
+    console.log(`[cosync] eager-push: ${files.length} files`);
+    for (const f of files) {
+      const room = this.roomNameFor(f);
+      if (this.rooms.has(room)) continue;
+      try {
+        await this.eagerSeedOne(f, room, wsUrl, token);
+      } catch (e) {
+        console.warn('[cosync] eager-push failed for', f.path, e);
+      }
+    }
+    console.log('[cosync] eager-push: done');
+  }
+
+  private async eagerSeedOne(file: TFile, room: string, wsUrl: string, token: string): Promise<void> {
+    const doc = new Y.Doc();
+    const yText = doc.getText('cosync');
+    const idb = new IndexeddbPersistence(room, doc);
+    await idb.whenSynced;
+
+    const provider = new WebsocketProvider(wsUrl, room, doc, {
+      params: { token },
+      connect: true,
+    });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('initial sync timeout')), 5000);
+        provider.once('synced', () => { clearTimeout(timer); resolve(); });
+      });
+
+      if (yText.length === 0) {
+        const content = await this.app.vault.read(file);
+        if (content.length > 0) {
+          doc.transact(() => yText.insert(0, content));
+          // Give the provider a beat to flush the update to the server.
+          await new Promise((r) => setTimeout(r, 150));
+        }
+      }
+    } finally {
+      provider.destroy();
+      await idb.destroy().catch(() => {});
+      doc.destroy();
+    }
+  }
+
   /** Tear everything down. Persists a final copy of each room to disk. */
   async closeAll(): Promise<void> {
     for (const entry of this.rooms.values()) {

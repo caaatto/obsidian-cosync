@@ -97,6 +97,12 @@ export default class CoSyncPlugin extends Plugin {
     } catch (e) {
       console.error('[cosync] vault index sync failed to start', e);
     }
+    // Eager-push runs in the background: any .md the user has locally but has
+    // not opened in this session still gets its content uploaded so other
+    // clients receive non-empty stubs.
+    void this.sync.eagerPushAllFiles().catch((e) => {
+      console.warn('[cosync] eager-push background task failed', e);
+    });
   }
 
   private async handleFileOpen(file: TFile | null) {
