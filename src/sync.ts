@@ -201,6 +201,10 @@ export class SyncManager {
       new Notice('[cosync] could not access CodeMirror editor');
       return;
     }
+    // Always (re-)apply the local caret color, even on idempotent calls.
+    // styles.css reads the CSS var from cm.dom to color the native caret
+    // in the user's presence color.
+    this.applySelfCursorColor(cm);
     // Identity check uses the Y.Doc reference, not the room name string.
     // The room name stays stable across SyncManager restarts (vaultId::path)
     // but the underlying Y.Doc is replaced; comparing strings would skip
@@ -235,6 +239,12 @@ export class SyncManager {
     for (const entry of this.rooms.values()) {
       entry.awareness.setLocalStateField('user', user);
     }
+  }
+
+  /** Set the CSS variable that drives the native caret color (see styles.css). */
+  private applySelfCursorColor(cm: EditorView): void {
+    const color = this.settings.userColor || '#3eb6f7';
+    cm.dom.style.setProperty('--cosync-self-cursor-color', color);
   }
 
   /**

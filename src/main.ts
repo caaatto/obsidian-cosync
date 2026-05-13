@@ -112,6 +112,9 @@ export default class CoSyncPlugin extends Plugin {
     this.sync?.updateAwarenessIdentity();
     this.vaultIndex?.updateLocalUser();
     this.renderPresence();
+    // Re-binding the current leaf is a no-op for yCollab (boundDoc check
+    // short-circuits) but it does re-apply the self-caret CSS variable.
+    this.bindCurrentLeaf();
   }
 
   private async stopSync() {

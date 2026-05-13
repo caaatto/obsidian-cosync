@@ -1,4 +1,6 @@
-/* obsidian-cosync — remote cursors / selections from y-codemirror.next */
+/* obsidian-cosync - cursor and selection styling */
+
+/* Remote cursors / selections from y-codemirror.next */
 
 .cm-ySelection {
   background-color: rgba(127, 127, 127, 0.18);
@@ -43,4 +45,20 @@
 .cm-ySelectionInfo > * {
   color: white;
   filter: none;
+}
+
+/*
+ * Own caret. yCollab only renders remote cursors; the local one stays the
+ * native Obsidian caret. Color it in the user's chosen presence color so
+ * "your color" matches across the file-explorer dots, the awareness status
+ * bar, and your own caret in the editor.
+ *
+ * The CSS variable is set on the CodeMirror root element by sync.ts in
+ * bindEditor; if no editor on this page has set it, the rule falls back
+ * to the default Obsidian caret color.
+ */
+.cm-editor .cm-cursor,
+.cm-editor .cm-cursor-primary {
+  border-left-color: var(--cosync-self-cursor-color, var(--text-normal)) !important;
+  border-left-width: 2px !important;
 }
