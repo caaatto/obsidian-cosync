@@ -3,7 +3,7 @@
 // new files appear automatically on the other side as empty stubs whose
 // contents fill in once the corresponding per-file SyncManager room opens.
 //
-// Delete is intentionally NOT propagated — removing the index entry when the
+// Delete is intentionally NOT propagated - removing the index entry when the
 // last user has the file would risk silent data loss. Users delete locally.
 
 import { App, EventRef, TFile } from 'obsidian';
@@ -136,7 +136,7 @@ export class VaultIndexSync {
         try {
           await vault.createFolder(parent);
         } catch {
-          // already exists or race — ignore
+          // already exists or race - ignore
         }
       }
     }

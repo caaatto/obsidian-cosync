@@ -1,12 +1,16 @@
-import { App, Notice, PluginSettingTab, Setting } from 'obsidian';
+import { App, Modal, Notice, PluginSettingTab, Setting } from 'obsidian';
 import type CoSyncPlugin from './main';
-import { effectiveDisplayName, isLoggedIn } from './types';
+import { LOCAL_VAULT_ID, isLoggedIn } from './types';
 import { login, logout, register } from './auth-client';
 
 export class CoSyncSettingTab extends PluginSettingTab {
   // Password and invite code are held in-memory only; never persisted via saveSettings().
   private pendingPassword = '';
   private pendingInviteCode = '';
+
+  // Add-vault form state, held until the user clicks "Add".
+  private newVaultName = '';
+  private newVaultId = '';
 
   constructor(app: App, private plugin: CoSyncPlugin) {
     super(app, plugin);
@@ -16,9 +20,9 @@ export class CoSyncSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl('h2', { text: 'CoSync — Live Collaboration' });
+    containerEl.createEl('h2', { text: 'CoSync - Live Collaboration' });
     containerEl.createEl('p', {
-      text: 'Live co-editing via a self-hosted Yjs server. Share the same Server URL + Vault ID with collaborators; each person logs in with their own username + password.',
+      text: 'Live co-editing via a self-hosted Yjs server. Save multiple vaults and switch between them; each switch moves your local .md files into a per-vault cache.',
       cls: 'setting-item-description',
     });
 
@@ -126,16 +130,130 @@ export class CoSyncSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }));
 
-    // ── Vault ──────────────────────────────────────────────────────
-    containerEl.createEl('h3', { text: 'Vault' });
+    // ── Vaults ──────────────────────────────────────────────────────
+    containerEl.createEl('h3', { text: 'Vaults' });
+    containerEl.createEl('p', {
+      text: 'Switch between saved vaults. Your local .md files are moved into a per-vault cache when you switch; on switching back, the cached files are restored. The "Local" vault is offline-only and never syncs.',
+      cls: 'setting-item-description',
+    });
 
+    const activeVault = this.plugin.settings.savedVaults.find((v) => v.id === this.plugin.settings.vaultId);
+    new Setting(containerEl)
+      .setName('Active vault')
+      .setDesc(`Currently active: "${activeVault?.name ?? this.plugin.settings.vaultId}".`)
+      .addDropdown((d) => {
+        for (const v of this.plugin.settings.savedVaults) {
+          d.addOption(v.id, v.id === LOCAL_VAULT_ID ? `${v.name} (offline)` : v.name);
+        }
+        d.setValue(this.plugin.settings.vaultId);
+        d.onChange(async (newId) => {
+          if (newId === this.plugin.settings.vaultId) return;
+          const ok = await this.confirmSwitch(newId);
+          if (!ok) {
+            d.setValue(this.plugin.settings.vaultId);
+            return;
+          }
+          await this.plugin.switchVault(newId);
+          this.display();
+        });
+      });
+
+    // List of saved vaults with delete buttons (except the local one).
+    const listEl = containerEl.createDiv({ cls: 'cosync-vault-list' });
+    for (const v of this.plugin.settings.savedVaults) {
+      const isLocal = v.id === LOCAL_VAULT_ID;
+      const isActive = v.id === this.plugin.settings.vaultId;
+      const row = new Setting(listEl)
+        .setName(`${v.name}${isActive ? '  (active)' : ''}`)
+        .setDesc(isLocal ? 'Offline-only vault. Cannot be removed.' : v.id);
+
+      if (!isLocal) {
+        row.addButton((b) => b
+          .setButtonText('Copy ID')
+          .onClick(async () => {
+            try {
+              await navigator.clipboard.writeText(v.id);
+              new Notice('CoSync: vault ID copied.');
+            } catch {
+              new Notice('CoSync: could not copy.');
+            }
+          }));
+        row.addButton((b) => b
+          .setButtonText('Remove')
+          .setWarning()
+          .setDisabled(isActive)
+          .onClick(async () => {
+            if (isActive) return;
+            const ok = await confirmDialog(this.app,
+              `Remove "${v.name}" from saved vaults?`,
+              'Its cached local copy will be deleted. Files on the sync server are not affected.');
+            if (!ok) return;
+            this.plugin.settings.savedVaults = this.plugin.settings.savedVaults.filter((x) => x.id !== v.id);
+            await this.plugin.saveSettings();
+            await this.plugin.dropVaultCache(v.id);
+            new Notice(`CoSync: removed "${v.name}".`);
+            this.display();
+          }));
+      }
+    }
+
+    // Add new vault.
+    containerEl.createEl('h4', { text: 'Add vault' });
+    new Setting(containerEl)
+      .setName('Vault name')
+      .setDesc('Friendly label, shown in the dropdown.')
+      .addText((t) => t
+        .setPlaceholder('e.g. Friends')
+        .setValue(this.newVaultName)
+        .onChange((v) => { this.newVaultName = v; }));
     new Setting(containerEl)
       .setName('Vault ID')
-      .setDesc('Identifies this vault on the server. Two vaults with the SAME ID sync together. Share this value with collaborators.')
-      .addText((t) => t.setValue(this.plugin.settings.vaultId).onChange(async (v) => {
-        this.plugin.settings.vaultId = v.trim();
-        await this.plugin.saveSettings();
+      .setDesc('Paste the shared vault code, or generate a new one.')
+      .addText((t) => t
+        .setPlaceholder('UUID / shared code')
+        .setValue(this.newVaultId)
+        .onChange((v) => { this.newVaultId = v.trim(); }))
+      .addButton((b) => b.setButtonText('Generate').onClick(() => {
+        this.newVaultId = generateUUID();
+        this.display();
       }));
+
+    new Setting(containerEl)
+      .addButton((b) => b
+        .setButtonText('Add vault')
+        .setCta()
+        .onClick(async () => {
+          const name = this.newVaultName.trim();
+          const id = this.newVaultId.trim();
+          if (!name || !id) {
+            new Notice('CoSync: name and vault ID are required.');
+            return;
+          }
+          if (id === LOCAL_VAULT_ID) {
+            new Notice('CoSync: that ID is reserved.');
+            return;
+          }
+          if (this.plugin.settings.savedVaults.some((v) => v.id === id)) {
+            new Notice('CoSync: a vault with that ID is already saved.');
+            return;
+          }
+          this.plugin.settings.savedVaults.push({ id, name });
+          await this.plugin.saveSettings();
+          this.newVaultName = '';
+          this.newVaultId = '';
+          new Notice(`CoSync: added "${name}".`);
+          this.display();
+        }));
+  }
+
+  private async confirmSwitch(newId: string): Promise<boolean> {
+    const next = this.plugin.settings.savedVaults.find((v) => v.id === newId);
+    const curr = this.plugin.settings.savedVaults.find((v) => v.id === this.plugin.settings.vaultId);
+    return confirmDialog(
+      this.app,
+      `Switch to "${next?.name ?? newId}"?`,
+      `All .md files currently in this vault will be moved into a cache for "${curr?.name ?? 'the current vault'}", and any previously cached files for the target will be restored. Editor sessions will be reconnected.`,
+    );
   }
 
   private async doLogin() {
@@ -170,7 +288,7 @@ export class CoSyncSettingTab extends PluginSettingTab {
     }
     const res = await register(s.serverUrl, s.username, this.pendingPassword, this.pendingInviteCode);
     if (!res.ok) {
-      new Notice(`CoSync: register failed — ${res.error}`);
+      new Notice(`CoSync: register failed - ${res.error}`);
       return;
     }
     this.pendingInviteCode = '';
@@ -187,4 +305,34 @@ export class CoSyncSettingTab extends PluginSettingTab {
     new Notice('CoSync: logged out.');
     this.display();
   }
+}
+
+function confirmDialog(app: App, title: string, body: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const modal = new (class extends Modal {
+      private result = false;
+      onOpen() {
+        this.titleEl.setText(title);
+        this.contentEl.createEl('p', { text: body });
+        const btns = this.contentEl.createDiv({ cls: 'modal-button-container' });
+        const cancel = btns.createEl('button', { text: 'Cancel' });
+        cancel.onclick = () => { this.result = false; this.close(); };
+        const ok = btns.createEl('button', { text: 'Continue', cls: 'mod-cta' });
+        ok.onclick = () => { this.result = true; this.close(); };
+      }
+      onClose() { resolve(this.result); }
+    })(app);
+    modal.open();
+  });
+}
+
+function generateUUID(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
 }

@@ -59,7 +59,7 @@ export class SyncManager {
     const wsUrl = this.settings.serverUrl.replace(/\/+$/, '');
     const token = effectiveToken(this.settings);
     if (!token) {
-      throw new Error('not authenticated — login in CoSync settings');
+      throw new Error('not authenticated - login in CoSync settings');
     }
     const provider = new WebsocketProvider(wsUrl, room, doc, {
       params: { token },

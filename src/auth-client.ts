@@ -69,5 +69,5 @@ export async function logout(serverUrl: string, token: string): Promise<void> {
   if (!token) return;
   try {
     await postJson(`${httpBase(serverUrl)}/auth/logout`, { token });
-  } catch { /* ignore — best effort */ }
+  } catch { /* ignore - best effort */ }
 }
