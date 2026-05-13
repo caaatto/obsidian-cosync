@@ -267,7 +267,13 @@ export class SyncManager {
     console.log(`[cosync] eager-push: ${files.length} files`);
     for (const f of files) {
       const room = this.roomNameFor(f);
+      // Skip if a live room is already open OR a concurrent openRoom is in
+      // flight. Running eagerSeedOne against the same room while openRoom is
+      // also creating a Y.Doc for it caused duplicate Y.Docs to sync to the
+      // server, producing the asymmetric-sync symptom (one side's updates
+      // referenced state the other side had no idea about).
       if (this.rooms.has(room)) continue;
+      if (this.openingRooms.has(room)) continue;
       try {
         await this.eagerSeedOne(f, room, wsUrl, token);
       } catch (e) {
@@ -277,11 +283,16 @@ export class SyncManager {
     console.log('[cosync] eager-push: done');
   }
 
+  /**
+   * Open a short-lived per-file room WITHOUT IndexeddbPersistence. Sharing
+   * the IDB key with the user-opened Y.Doc for the same file led to two
+   * IDB connections writing into the same database concurrently, which
+   * corrupted the locally-loaded state on subsequent loads. Server is the
+   * source of truth here anyway - we only need the WebSocket transport.
+   */
   private async eagerSeedOne(file: TFile, room: string, wsUrl: string, token: string): Promise<void> {
     const doc = new Y.Doc();
     const yText = doc.getText('cosync');
-    const idb = new IndexeddbPersistence(room, doc);
-    await idb.whenSynced;
 
     const provider = new WebsocketProvider(wsUrl, room, doc, {
       params: { token },
@@ -304,7 +315,6 @@ export class SyncManager {
       }
     } finally {
       provider.destroy();
-      await idb.destroy().catch(() => {});
       doc.destroy();
     }
   }

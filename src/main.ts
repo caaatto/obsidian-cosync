@@ -56,6 +56,16 @@ export default class CoSyncPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: 'reset-local-cache',
+      name: 'Reset local cache for active vault (forces re-sync from server)',
+      checkCallback: (checking) => {
+        if (isLocalActive(this.settings)) return false;
+        if (!checking) void this.confirmAndResetLocalCache();
+        return true;
+      },
+    });
+
+    this.addCommand({
       id: 'show-file-history',
       name: 'Show file history',
       checkCallback: (checking) => {
@@ -358,6 +368,59 @@ export default class CoSyncPlugin extends Plugin {
       stack.push(...folders);
     }
     return out;
+  }
+
+  /**
+   * Confirm with user, then drop every local IndexedDB database that belongs
+   * to the active vault (these are y-indexeddb caches of the Y.Docs). After
+   * the cache is gone, sync is restarted; the rooms reload from the server
+   * which becomes the single source of truth.
+   *
+   * Use case: a client's local cache got out of sync with the server (e.g.
+   * old corrupt state from earlier plugin bugs) and edits don't propagate
+   * symmetrically. This wipes the local cache so the next connect rebuilds
+   * cleanly.
+   */
+  private async confirmAndResetLocalCache(): Promise<void> {
+    const ok = await new Promise<boolean>((resolve) => {
+      new ConfirmModal(
+        this.app,
+        'Reset local cache?',
+        'This will delete every locally cached Y.Doc for the active vault and re-download state from the server. Unsynced offline edits will be lost. Other devices and the .md files on disk are not affected.',
+        resolve,
+      ).open();
+    });
+    if (!ok) return;
+
+    new Notice('CoSync: resetting local cache...');
+    await this.stopSync();
+
+    const prefix = `${this.settings.vaultId}::`;
+    let removed = 0;
+    try {
+      // indexedDB.databases() is supported in modern Chromium (Obsidian uses Electron).
+      const all = await (indexedDB as unknown as {
+        databases?: () => Promise<Array<{ name?: string }>>;
+      }).databases?.();
+      if (all) {
+        for (const info of all) {
+          if (!info.name || !info.name.startsWith(prefix)) continue;
+          await new Promise<void>((resolve) => {
+            const req = indexedDB.deleteDatabase(info.name!);
+            req.onsuccess = () => resolve();
+            req.onerror = () => resolve();
+            req.onblocked = () => resolve();
+          });
+          removed++;
+        }
+      }
+    } catch (e) {
+      console.warn('[cosync] reset cache failed', e);
+    }
+
+    await this.startSyncIfConfigured();
+    this.bindCurrentLeaf();
+    new Notice(`CoSync: cleared ${removed} cached room${removed === 1 ? '' : 's'} and restarted sync.`);
   }
 
   // Presence display (Google Docs-style avatar row in the status bar).
