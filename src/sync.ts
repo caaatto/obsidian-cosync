@@ -219,6 +219,13 @@ export class SyncManager {
       binding.compartment.set(cm, comp);
       cm.dispatch({ effects: StateEffect.appendConfig.of(comp.of(ext)) });
     } else {
+      // Two-step swap: reconfigure to empty first so y-codemirror.next's
+      // ViewPlugin actually goes through its destroy() path and detaches
+      // the observer from the OLD yText. A direct reconfigure(ext) keeps
+      // the ViewPlugin instance alive (CM6 treats the spec reference as
+      // unchanged) so its internal observer stays bound to the previous
+      // yText - which is exactly the "sync dies on note switch" symptom.
+      cm.dispatch({ effects: comp.reconfigure([]) });
       cm.dispatch({ effects: comp.reconfigure(ext) });
     }
     binding.boundDoc.set(cm, entry.doc);
