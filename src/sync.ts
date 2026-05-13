@@ -195,40 +195,45 @@ export class SyncManager {
    * Uses a Compartment so we can cleanly reconfigure when the user switches files
    * within the same leaf (Obsidian reuses the same EditorView).
    */
-  bindEditor(view: MarkdownView, entry: RoomEntry, binding: EditorBindingState) {
+  async bindEditor(view: MarkdownView, entry: RoomEntry, binding: EditorBindingState): Promise<void> {
     const cm = (view.editor as unknown as { cm?: EditorView }).cm;
     if (!cm) {
       new Notice('[cosync] could not access CodeMirror editor');
       return;
     }
     // Always (re-)apply the local caret color, even on idempotent calls.
-    // styles.css reads the CSS var from cm.dom to color the native caret
-    // in the user's presence color.
     this.applySelfCursorColor(cm);
-    // Identity check uses the Y.Doc reference, not the room name string.
-    // The room name stays stable across SyncManager restarts (vaultId::path)
-    // but the underlying Y.Doc is replaced; comparing strings would skip
-    // the reconfigure and leave the editor bound to a destroyed Y.Doc.
-    if (binding.boundDoc.get(cm) === entry.doc) return;
+
+    const previousDoc = binding.boundDoc.get(cm);
+    if (previousDoc === entry.doc) return;
+
+    const docId = entry.doc.guid.slice(0, 8);
+    const prevId = previousDoc?.guid?.slice(0, 8) ?? 'none';
+    console.log(`[cosync] bindEditor file=${entry.filePath} doc=${docId} prev=${prevId}`);
 
     const ext = yCollab(entry.yText, entry.awareness, { undoManager: entry.undoMgr });
 
-    let comp = binding.compartment.get(cm);
-    if (!comp) {
-      comp = new Compartment();
-      binding.compartment.set(cm, comp);
-      cm.dispatch({ effects: StateEffect.appendConfig.of(comp.of(ext)) });
-    } else {
-      // Two-step swap: reconfigure to empty first so y-codemirror.next's
-      // ViewPlugin actually goes through its destroy() path and detaches
-      // the observer from the OLD yText. A direct reconfigure(ext) keeps
-      // the ViewPlugin instance alive (CM6 treats the spec reference as
-      // unchanged) so its internal observer stays bound to the previous
-      // yText - which is exactly the "sync dies on note switch" symptom.
-      cm.dispatch({ effects: comp.reconfigure([]) });
-      cm.dispatch({ effects: comp.reconfigure(ext) });
+    // y-codemirror.next's YSyncPluginValue captures `this.conf.ytext` ONCE
+    // in its constructor and only unobserves on destroy(). When we change
+    // the bound Y.Doc, CM6 needs to actually destroy the old PluginValue
+    // and construct a new one - otherwise the observer stays on the old
+    // yText and edits to the new yText don't get broadcast.
+    //
+    // We use a fresh Compartment per binding (old one is reconfigured to
+    // empty so its plugins go through destroy) and we yield to the
+    // microtask queue between the two dispatches so CM6's plugin lifecycle
+    // can run cleanly before we re-add yCollab.
+    const oldComp = binding.compartment.get(cm);
+    if (oldComp) {
+      cm.dispatch({ effects: oldComp.reconfigure([]) });
     }
+    await Promise.resolve();
+    const freshComp = new Compartment();
+    binding.compartment.set(cm, freshComp);
+    cm.dispatch({ effects: StateEffect.appendConfig.of(freshComp.of(ext)) });
     binding.boundDoc.set(cm, entry.doc);
+
+    console.log(`[cosync] bindEditor: bound doc=${docId}`);
   }
 
   /**

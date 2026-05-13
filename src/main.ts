@@ -234,7 +234,7 @@ export default class CoSyncPlugin extends Plugin {
     this.broadcastCurrentFile(view.file.path);
     try {
       const entry = await this.sync.openRoom(view.file);
-      this.sync.bindEditor(view, entry, this.editorBinding);
+      await this.sync.bindEditor(view, entry, this.editorBinding);
     } catch (e) {
       console.error('[cosync] bindCurrentLeaf failed', e);
     }
