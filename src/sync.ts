@@ -29,6 +29,12 @@ const SAVE_DEBOUNCE_MS = 1000;
 
 export class SyncManager {
   private rooms = new Map<string, RoomEntry>();
+  // Tracks rooms whose openRoom() is in flight. Without this, file-open and
+  // active-leaf-change events for the same file race and produce two parallel
+  // IndexeddbPersistence + WebsocketProvider instances on the same room,
+  // which results in "Caught error while handling a Yjs update" and a
+  // disconnect/reconnect loop.
+  private openingRooms = new Map<string, Promise<RoomEntry>>();
   private editorCompartment = new WeakMap<EditorView, Compartment>();
   private editorBoundRoom = new WeakMap<EditorView, string>();
   private renameEventRef: EventRef;
@@ -89,7 +95,17 @@ export class SyncManager {
     const room = this.roomNameFor(file);
     const existing = this.rooms.get(room);
     if (existing) return existing;
+    const inflight = this.openingRooms.get(room);
+    if (inflight) return inflight;
 
+    const promise = this.createRoom(file, room).finally(() => {
+      this.openingRooms.delete(room);
+    });
+    this.openingRooms.set(room, promise);
+    return promise;
+  }
+
+  private async createRoom(file: TFile, room: string): Promise<RoomEntry> {
     const doc = new Y.Doc();
     const yText = doc.getText('cosync');
     const undoMgr = new Y.UndoManager(yText);
@@ -191,6 +207,23 @@ export class SyncManager {
       cm.dispatch({ effects: comp.reconfigure(ext) });
     }
     this.editorBoundRoom.set(cm, entry.room);
+  }
+
+  /**
+   * Re-broadcast the local user identity (name + color) to every live room.
+   * Called when settings change so other clients see the new cursor color
+   * without having to reconnect or wait for the next focus change.
+   */
+  updateAwarenessIdentity(): void {
+    const color = this.settings.userColor || '#3eb6f7';
+    const user = {
+      name: effectiveDisplayName(this.settings),
+      color,
+      colorLight: color + '33',
+    };
+    for (const entry of this.rooms.values()) {
+      entry.awareness.setLocalStateField('user', user);
+    }
   }
 
   /**

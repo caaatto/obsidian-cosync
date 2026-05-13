@@ -72,6 +72,16 @@ export default class CoSyncPlugin extends Plugin {
     this.bindCurrentLeaf();
   }
 
+  /**
+   * Lighter-weight settings save: persists settings + re-broadcasts the local
+   * awareness identity to all open rooms. Use this for changes that should
+   * NOT tear down and reconnect the sync (display name, cursor color, etc.).
+   */
+  async saveSettingsLight() {
+    await this.saveData(this.settings);
+    this.sync?.updateAwarenessIdentity();
+  }
+
   private async stopSync() {
     if (this.vaultIndex) {
       await this.vaultIndex.stop();

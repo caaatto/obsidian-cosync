@@ -121,7 +121,7 @@ export class CoSyncSettingTab extends PluginSettingTab {
         .setValue(this.plugin.settings.displayName)
         .onChange(async (v) => {
           this.plugin.settings.displayName = v;
-          await this.plugin.saveSettings();
+          await this.plugin.saveSettingsLight();
           this.schedulePushProfile();
         }));
 
@@ -132,7 +132,7 @@ export class CoSyncSettingTab extends PluginSettingTab {
         .setValue(this.plugin.settings.userColor)
         .onChange(async (v) => {
           this.plugin.settings.userColor = v;
-          await this.plugin.saveSettings();
+          await this.plugin.saveSettingsLight();
           this.schedulePushProfile();
         }));
 
