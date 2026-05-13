@@ -1,10 +1,12 @@
 // Vault-level file index: a single Y.Doc per vault holds the set of known
-// Markdown paths. Each vault keeps its local file list in sync with the index;
-// new files appear automatically on the other side as empty stubs whose
-// contents fill in once the corresponding per-file SyncManager room opens.
+// Markdown paths plus tombstones for paths that have been deleted. Each
+// vault keeps its local file list in sync with the index; new files appear
+// automatically on the other side as empty stubs whose contents fill in
+// once the corresponding per-file SyncManager room opens.
 //
-// Delete is intentionally NOT propagated - removing the index entry when the
-// last user has the file would risk silent data loss. Users delete locally.
+// Schema: Y.Map<string, FileEntry> where FileEntry.deletedAt is the unix-ms
+// timestamp at which the path was tombstoned. Absence of deletedAt (or the
+// legacy `{ exists: true }` shape) means the path is alive.
 
 import { App, EventRef, Notice, TFile } from 'obsidian';
 import * as Y from 'yjs';
@@ -15,7 +17,21 @@ import { effectiveDisplayName, effectiveToken, type CoSyncSettings } from './typ
 
 const INDEX_ROOM_KEY = '__INDEX__';
 
-interface FileEntry { exists: true }
+interface FileEntry {
+  // Legacy field from pre-0.9 plugins, kept for backwards compat.
+  exists?: true;
+  // Unix-ms timestamp; if set, this path is tombstoned (deleted).
+  deletedAt?: number;
+}
+
+function isAlive(entry: FileEntry | undefined): boolean {
+  if (!entry) return false;
+  return !entry.deletedAt;
+}
+
+function isTombstoned(entry: FileEntry | undefined): boolean {
+  return !!entry?.deletedAt;
+}
 
 export class VaultIndexSync {
   private doc?: Y.Doc;
@@ -61,7 +77,7 @@ export class VaultIndexSync {
     this.vaultEventRefs.push(vault.on('create', (file) => {
       if (this.suppressLocalEvents) return;
       if (!(file instanceof TFile) || file.extension !== 'md') return;
-      this.addPath(file.path);
+      this.markAlive(file.path);
     }));
 
     this.vaultEventRefs.push(vault.on('rename', (file, oldPath) => {
@@ -70,36 +86,61 @@ export class VaultIndexSync {
       const map = this.files;
       if (!map) return;
       this.doc?.transact(() => {
-        map.delete(oldPath);
-        map.set(file.path, { exists: true });
+        map.set(oldPath, { deletedAt: Date.now() });
+        map.set(file.path, {});
       });
     }));
 
     this.vaultEventRefs.push(vault.on('delete', (file) => {
       if (this.suppressLocalEvents) return;
       if (!(file instanceof TFile) || file.extension !== 'md') return;
-      this.files?.delete(file.path);
+      this.files?.set(file.path, { deletedAt: Date.now() });
     }));
   }
 
-  private addPath(path: string) {
-    if (!this.files || this.files.has(path)) return;
-    this.files.set(path, { exists: true });
+  /** Insert / un-tombstone a path. Idempotent if the path is already alive. */
+  private markAlive(path: string) {
+    const map = this.files;
+    if (!map) return;
+    const existing = map.get(path);
+    if (isAlive(existing)) return;
+    map.set(path, {});
   }
 
   private reconcileAfterSync() {
     const map = this.files;
     if (!map) return;
 
-    // 1) Push any local-only paths up into the index.
-    for (const f of this.app.vault.getMarkdownFiles()) {
-      if (!map.has(f.path)) map.set(f.path, { exists: true });
-    }
-
-    // 2) For every index entry missing locally, create an empty stub.
     this.suppressLocalEvents = true;
     try {
-      for (const path of map.keys()) {
+      // 1) For every local .md, reconcile with the index.
+      for (const f of this.app.vault.getMarkdownFiles()) {
+        const entry = map.get(f.path);
+        if (!entry) {
+          // Genuinely new file: publish it.
+          map.set(f.path, {});
+          continue;
+        }
+        if (isTombstoned(entry)) {
+          // The path was tombstoned. Decide: did the local user keep
+          // modifying it AFTER the tombstone (offline edits)? If yes,
+          // resurrect; if not, trash locally.
+          const mtime = f.stat?.mtime ?? 0;
+          const deletedAt = entry.deletedAt ?? 0;
+          if (mtime > deletedAt) {
+            // Offline edits after the delete: bring the file back.
+            map.set(f.path, {});
+          } else {
+            // Stale local copy: move to trash, the remote delete wins.
+            void this.handleRemoteDelete(f.path);
+          }
+        }
+        // else: entry exists and is alive, nothing to do.
+      }
+
+      // 2) For every alive index entry without a local file: create a stub.
+      for (const [path, entry] of map.entries()) {
+        if (!isAlive(entry)) continue;
         if (!this.app.vault.getAbstractFileByPath(path)) {
           void this.createLocalStub(path);
         }
@@ -110,17 +151,29 @@ export class VaultIndexSync {
   }
 
   private onRemoteChange(event: Y.YMapEvent<FileEntry>) {
-    if (!this.files) return;
+    const map = this.files;
+    if (!map) return;
     this.suppressLocalEvents = true;
     try {
       for (const [path, change] of event.changes.keys) {
-        if (change.action === 'add' || change.action === 'update') {
+        if (change.action === 'delete') {
+          // Pre-tombstone clients used Y.Map.delete; honor as a delete.
+          void this.handleRemoteDelete(path);
+          continue;
+        }
+        const current = map.get(path);
+        const wasAlive = isAlive(change.oldValue as FileEntry | undefined);
+        const nowAlive = isAlive(current);
+        if (wasAlive && !nowAlive) {
+          // Transitioned to tombstone: trash locally.
+          void this.handleRemoteDelete(path);
+        } else if (!wasAlive && nowAlive) {
+          // Resurrected or freshly created: ensure local stub.
           if (!this.app.vault.getAbstractFileByPath(path)) {
             void this.createLocalStub(path);
           }
-        } else if (change.action === 'delete') {
-          void this.handleRemoteDelete(path);
         }
+        // Otherwise: no observable change in liveness.
       }
     } finally {
       this.suppressLocalEvents = false;
