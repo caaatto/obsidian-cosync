@@ -1,7 +1,9 @@
 import { App, MarkdownView, Modal, Notice, Plugin, TFile, WorkspaceLeaf, normalizePath } from 'obsidian';
 import * as Y from 'yjs';
+import type { Compartment } from '@codemirror/state';
+import type { EditorView } from '@codemirror/view';
 import { CoSyncSettingTab } from './settings';
-import { SyncManager } from './sync';
+import { SyncManager, type EditorBindingState } from './sync';
 import { VaultIndexSync } from './vault-index';
 import { listHistory, getSnapshot } from './auth-client';
 import {
@@ -17,6 +19,13 @@ export default class CoSyncPlugin extends Plugin {
   settings!: CoSyncSettings;
   sync: SyncManager | null = null;
   vaultIndex: VaultIndexSync | null = null;
+  // Plugin-scoped binding state. Survives SyncManager replacement so
+  // saveSettings does not leak a fresh yCollab compartment into the editor
+  // on every settings tick.
+  private editorBinding: EditorBindingState = {
+    compartment: new WeakMap<EditorView, Compartment>(),
+    boundDoc: new WeakMap<EditorView, Y.Doc>(),
+  };
 
   async onload() {
     await this.loadSettings();
@@ -153,7 +162,7 @@ export default class CoSyncPlugin extends Plugin {
     if (!view || !view.file) return;
     try {
       const entry = await this.sync.openRoom(view.file);
-      this.sync.bindEditor(view, entry);
+      this.sync.bindEditor(view, entry, this.editorBinding);
     } catch (e) {
       console.error('[cosync] bindCurrentLeaf failed', e);
     }

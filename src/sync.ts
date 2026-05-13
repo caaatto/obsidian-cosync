@@ -27,6 +27,15 @@ interface RoomEntry {
 const ROOM_SEP = '::';
 const SAVE_DEBOUNCE_MS = 1000;
 
+export interface EditorBindingState {
+  // The plugin owns these so they survive SyncManager replacement on
+  // saveSettings. Otherwise each settings change would append a new yCollab
+  // compartment to every open editor, leaking bindings that point at
+  // destroyed Y.Docs.
+  compartment: WeakMap<EditorView, Compartment>;
+  boundDoc: WeakMap<EditorView, Y.Doc>;
+}
+
 export class SyncManager {
   private rooms = new Map<string, RoomEntry>();
   // Tracks rooms whose openRoom() is in flight. Without this, file-open and
@@ -35,8 +44,6 @@ export class SyncManager {
   // which results in "Caught error while handling a Yjs update" and a
   // disconnect/reconnect loop.
   private openingRooms = new Map<string, Promise<RoomEntry>>();
-  private editorCompartment = new WeakMap<EditorView, Compartment>();
-  private editorBoundRoom = new WeakMap<EditorView, string>();
   private renameEventRef: EventRef;
 
   constructor(private app: App, private settings: CoSyncSettings) {
@@ -188,25 +195,29 @@ export class SyncManager {
    * Uses a Compartment so we can cleanly reconfigure when the user switches files
    * within the same leaf (Obsidian reuses the same EditorView).
    */
-  bindEditor(view: MarkdownView, entry: RoomEntry) {
+  bindEditor(view: MarkdownView, entry: RoomEntry, binding: EditorBindingState) {
     const cm = (view.editor as unknown as { cm?: EditorView }).cm;
     if (!cm) {
       new Notice('[cosync] could not access CodeMirror editor');
       return;
     }
-    if (this.editorBoundRoom.get(cm) === entry.room) return;
+    // Identity check uses the Y.Doc reference, not the room name string.
+    // The room name stays stable across SyncManager restarts (vaultId::path)
+    // but the underlying Y.Doc is replaced; comparing strings would skip
+    // the reconfigure and leave the editor bound to a destroyed Y.Doc.
+    if (binding.boundDoc.get(cm) === entry.doc) return;
 
     const ext = yCollab(entry.yText, entry.awareness, { undoManager: entry.undoMgr });
 
-    let comp = this.editorCompartment.get(cm);
+    let comp = binding.compartment.get(cm);
     if (!comp) {
       comp = new Compartment();
-      this.editorCompartment.set(cm, comp);
+      binding.compartment.set(cm, comp);
       cm.dispatch({ effects: StateEffect.appendConfig.of(comp.of(ext)) });
     } else {
       cm.dispatch({ effects: comp.reconfigure(ext) });
     }
-    this.editorBoundRoom.set(cm, entry.room);
+    binding.boundDoc.set(cm, entry.doc);
   }
 
   /**
