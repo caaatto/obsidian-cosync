@@ -10,7 +10,8 @@ import { App, EventRef, TFile } from 'obsidian';
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
 import { IndexeddbPersistence } from 'y-indexeddb';
-import { effectiveToken, type CoSyncSettings } from './types';
+import type { Awareness } from 'y-protocols/awareness';
+import { effectiveDisplayName, effectiveToken, type CoSyncSettings } from './types';
 
 const INDEX_ROOM_KEY = '__INDEX__';
 
@@ -46,6 +47,7 @@ export class VaultIndexSync {
       params: { token },
       connect: true,
     });
+    this.applyLocalUser();
 
     this.provider.once('synced', () => this.reconcileAfterSync());
     files.observe((event) => this.onRemoteChange(event));
@@ -145,6 +147,26 @@ export class VaultIndexSync {
     } catch (e) {
       console.warn('[cosync] could not create local stub', path, e);
     }
+  }
+
+  /** Awareness for the vault-wide presence channel. Undefined if not started. */
+  get awareness(): Awareness | undefined {
+    return this.provider?.awareness;
+  }
+
+  /** Re-broadcast the local user identity (name + color) on this awareness channel. */
+  updateLocalUser(): void {
+    this.applyLocalUser();
+  }
+
+  private applyLocalUser(): void {
+    if (!this.provider) return;
+    const color = this.settings.userColor || '#3eb6f7';
+    this.provider.awareness.setLocalStateField('user', {
+      name: effectiveDisplayName(this.settings),
+      color,
+      colorLight: color + '33',
+    });
   }
 
   async stop(): Promise<void> {

@@ -26,6 +26,8 @@ export default class CoSyncPlugin extends Plugin {
     compartment: new WeakMap<EditorView, Compartment>(),
     boundDoc: new WeakMap<EditorView, Y.Doc>(),
   };
+  private statusBarEl: HTMLElement | null = null;
+  private presenceAwarenessListener: (() => void) | null = null;
 
   async onload() {
     await this.loadSettings();
@@ -35,6 +37,12 @@ export default class CoSyncPlugin extends Plugin {
     }
 
     this.addSettingTab(new CoSyncSettingTab(this.app, this));
+
+    this.statusBarEl = this.addStatusBarItem();
+    this.statusBarEl.addClass('cosync-presence');
+    this.statusBarEl.style.display = 'none';
+    this.statusBarEl.onclick = () => this.showPresencePopup();
+    this.renderPresence();
 
     this.addRibbonIcon('users', 'CoSync: switch vault', () => {
       new VaultSwitcherModal(this.app, this).open();
@@ -89,9 +97,12 @@ export default class CoSyncPlugin extends Plugin {
   async saveSettingsLight() {
     await this.saveData(this.settings);
     this.sync?.updateAwarenessIdentity();
+    this.vaultIndex?.updateLocalUser();
+    this.renderPresence();
   }
 
   private async stopSync() {
+    this.detachPresenceListener();
     if (this.vaultIndex) {
       await this.vaultIndex.stop();
       this.vaultIndex = null;
@@ -100,6 +111,7 @@ export default class CoSyncPlugin extends Plugin {
       await this.sync.closeAll();
       this.sync = null;
     }
+    this.renderPresence();
   }
 
   private async startSyncIfConfigured() {
@@ -127,6 +139,7 @@ export default class CoSyncPlugin extends Plugin {
     this.vaultIndex = new VaultIndexSync(this.app, this.settings);
     try {
       await this.vaultIndex.start();
+      this.attachPresenceListener();
     } catch (e) {
       console.error('[cosync] vault index sync failed to start', e);
     }
@@ -328,6 +341,107 @@ export default class CoSyncPlugin extends Plugin {
       stack.push(...folders);
     }
     return out;
+  }
+
+  // Presence display (Google Docs-style avatar row in the status bar).
+
+  private attachPresenceListener() {
+    this.detachPresenceListener();
+    const awareness = this.vaultIndex?.awareness;
+    if (!awareness) return;
+    const handler = () => this.renderPresence();
+    awareness.on('change', handler);
+    this.presenceAwarenessListener = () => awareness.off('change', handler);
+    this.renderPresence();
+  }
+
+  private detachPresenceListener() {
+    if (this.presenceAwarenessListener) {
+      try { this.presenceAwarenessListener(); } catch { /* ignore */ }
+      this.presenceAwarenessListener = null;
+    }
+  }
+
+  private collectPresenceUsers(): Array<{ id: number; name: string; color: string; isSelf: boolean }> {
+    const aw = this.vaultIndex?.awareness;
+    if (!aw) return [];
+    const myId = aw.clientID;
+    const out: Array<{ id: number; name: string; color: string; isSelf: boolean }> = [];
+    aw.getStates().forEach((state, id) => {
+      const u = (state as any).user;
+      if (!u || typeof u.name !== 'string') return;
+      out.push({
+        id,
+        name: u.name,
+        color: typeof u.color === 'string' ? u.color : '#3eb6f7',
+        isSelf: id === myId,
+      });
+    });
+    // Self first, then others alphabetically.
+    out.sort((a, b) => {
+      if (a.isSelf !== b.isSelf) return a.isSelf ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+    return out;
+  }
+
+  private renderPresence() {
+    const el = this.statusBarEl;
+    if (!el) return;
+    el.empty();
+
+    if (!this.vaultIndex || isLocalActive(this.settings)) {
+      el.style.display = 'none';
+      return;
+    }
+
+    const users = this.collectPresenceUsers();
+    if (users.length === 0) {
+      el.style.display = 'inline-flex';
+      el.style.alignItems = 'center';
+      el.style.opacity = '0.6';
+      el.style.fontSize = '0.85em';
+      el.setText('CoSync: connecting...');
+      return;
+    }
+
+    el.style.display = 'inline-flex';
+    el.style.alignItems = 'center';
+    el.style.gap = '3px';
+    el.style.opacity = '1';
+    el.style.cursor = 'pointer';
+    el.style.fontSize = '';
+
+    const MAX_VISIBLE = 5;
+    const visible = users.slice(0, MAX_VISIBLE);
+    for (const u of visible) {
+      const dot = el.createSpan();
+      dot.style.background = u.color;
+      dot.style.color = pickReadableTextColor(u.color);
+      dot.style.borderRadius = '50%';
+      dot.style.width = '16px';
+      dot.style.height = '16px';
+      dot.style.display = 'inline-flex';
+      dot.style.alignItems = 'center';
+      dot.style.justifyContent = 'center';
+      dot.style.fontSize = '0.65em';
+      dot.style.fontWeight = 'bold';
+      dot.style.border = u.isSelf ? '1.5px solid var(--text-normal)' : 'none';
+      dot.setText((u.name.charAt(0) || '?').toUpperCase());
+      dot.title = u.isSelf ? `${u.name} (you)` : u.name;
+    }
+    if (users.length > MAX_VISIBLE) {
+      const more = el.createSpan({ text: `+${users.length - MAX_VISIBLE}` });
+      more.style.marginLeft = '2px';
+      more.style.fontSize = '0.85em';
+      more.style.opacity = '0.8';
+    }
+  }
+
+  private showPresencePopup() {
+    const users = this.collectPresenceUsers();
+    if (users.length === 0) return;
+    new PresenceModal(this.app, users).open();
   }
 
   private async removeDirRecursive(dir: string): Promise<void> {
@@ -563,6 +677,43 @@ class ConfirmModal extends Modal {
     btns.createEl('button', { text: 'Confirm', cls: 'mod-cta' }).onclick = () => { this.result = true; this.close(); };
   }
   onClose() { this.onResolve(this.result); }
+}
+
+class PresenceModal extends Modal {
+  constructor(app: App, private users: Array<{ id: number; name: string; color: string; isSelf: boolean }>) {
+    super(app);
+  }
+  onOpen() {
+    this.titleEl.setText(`Online in this vault (${this.users.length})`);
+    const { contentEl } = this;
+    for (const u of this.users) {
+      const row = contentEl.createDiv();
+      row.style.display = 'flex';
+      row.style.alignItems = 'center';
+      row.style.gap = '0.5rem';
+      row.style.padding = '0.3rem 0';
+      const dot = row.createSpan();
+      dot.style.background = u.color;
+      dot.style.width = '14px';
+      dot.style.height = '14px';
+      dot.style.borderRadius = '50%';
+      dot.style.flexShrink = '0';
+      row.createEl('span', { text: u.isSelf ? `${u.name} (you)` : u.name });
+    }
+  }
+  onClose() { this.contentEl.empty(); }
+}
+
+function pickReadableTextColor(hex: string): string {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
+  if (!m) return '#fff';
+  const n = parseInt(m[1], 16);
+  const r = (n >> 16) & 0xff;
+  const g = (n >> 8) & 0xff;
+  const b = n & 0xff;
+  // Relative luminance heuristic; light colors get black text, dark get white.
+  const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return lum > 0.6 ? '#000' : '#fff';
 }
 
 function formatTimestamp(ms: number): string {
