@@ -28,6 +28,7 @@ export default class CoSyncPlugin extends Plugin {
   };
   private statusBarEl: HTMLElement | null = null;
   private presenceAwarenessListener: (() => void) | null = null;
+  private currentActiveFile: string | null = null;
 
   async onload() {
     await this.loadSettings();
@@ -70,12 +71,14 @@ export default class CoSyncPlugin extends Plugin {
 
     this.registerEvent(this.app.workspace.on('file-open', this.handleFileOpen.bind(this)));
     this.registerEvent(this.app.workspace.on('active-leaf-change', this.handleLeafChange.bind(this)));
+    this.registerEvent(this.app.workspace.on('layout-change', () => this.renderFileExplorerHighlights()));
 
     this.app.workspace.onLayoutReady(() => this.bindCurrentLeaf());
   }
 
   async onunload() {
     await this.stopSync();
+    document.querySelectorAll('.cosync-file-presence').forEach((el) => el.remove());
   }
 
   async loadSettings() {
@@ -112,6 +115,7 @@ export default class CoSyncPlugin extends Plugin {
       this.sync = null;
     }
     this.renderPresence();
+    this.renderFileExplorerHighlights();
   }
 
   private async startSyncIfConfigured() {
@@ -170,15 +174,28 @@ export default class CoSyncPlugin extends Plugin {
   }
 
   private async bindCurrentLeaf() {
-    if (!this.sync) return;
+    if (!this.sync) {
+      this.broadcastCurrentFile(null);
+      return;
+    }
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    if (!view || !view.file) return;
+    if (!view || !view.file) {
+      this.broadcastCurrentFile(null);
+      return;
+    }
+    this.broadcastCurrentFile(view.file.path);
     try {
       const entry = await this.sync.openRoom(view.file);
       this.sync.bindEditor(view, entry, this.editorBinding);
     } catch (e) {
       console.error('[cosync] bindCurrentLeaf failed', e);
     }
+  }
+
+  private broadcastCurrentFile(path: string | null) {
+    if (this.currentActiveFile === path) return;
+    this.currentActiveFile = path;
+    this.vaultIndex?.updateCurrentFile(path);
   }
 
   // ── Vault switching ──────────────────────────────────────────────────
@@ -349,10 +366,18 @@ export default class CoSyncPlugin extends Plugin {
     this.detachPresenceListener();
     const awareness = this.vaultIndex?.awareness;
     if (!awareness) return;
-    const handler = () => this.renderPresence();
+    const handler = () => {
+      this.renderPresence();
+      this.renderFileExplorerHighlights();
+    };
     awareness.on('change', handler);
     this.presenceAwarenessListener = () => awareness.off('change', handler);
+    // Re-broadcast our current file now that the awareness channel is live.
+    if (this.currentActiveFile) {
+      this.vaultIndex?.updateCurrentFile(this.currentActiveFile);
+    }
     this.renderPresence();
+    this.renderFileExplorerHighlights();
   }
 
   private detachPresenceListener() {
@@ -442,6 +467,43 @@ export default class CoSyncPlugin extends Plugin {
     const users = this.collectPresenceUsers();
     if (users.length === 0) return;
     new PresenceModal(this.app, users).open();
+  }
+
+  /**
+   * Decorate the file-explorer side panel: every file currently held by some
+   * collaborator (including this user) gets a row of small colored circles
+   * indicating who is in it. Hover shows the name(s).
+   */
+  private renderFileExplorerHighlights() {
+    // First, always wipe the previous decoration so a "user moved away" state
+    // does not leave stale dots behind.
+    document.querySelectorAll('.cosync-file-presence').forEach((el) => el.remove());
+
+    const aw = this.vaultIndex?.awareness;
+    if (!aw) return;
+
+    const usersByPath = new Map<string, Array<{ name: string; color: string; isSelf: boolean }>>();
+    const myId = aw.clientID;
+    aw.getStates().forEach((state, id) => {
+      const u = (state as any).user;
+      const file = (state as any).currentFile;
+      if (!u || typeof file !== 'string' || !file) return;
+      const list = usersByPath.get(file) ?? [];
+      list.push({
+        name: typeof u.name === 'string' ? u.name : '?',
+        color: typeof u.color === 'string' ? u.color : '#3eb6f7',
+        isSelf: id === myId,
+      });
+      usersByPath.set(file, list);
+    });
+
+    if (usersByPath.size === 0) return;
+
+    for (const [path, users] of usersByPath) {
+      // `data-path` is set by Obsidian's FileExplorerView on every nav-file-title element.
+      const titleEls = document.querySelectorAll<HTMLElement>(`.nav-file-title[data-path="${cssEscape(path)}"]`);
+      titleEls.forEach((titleEl) => attachPresenceBadge(titleEl, users));
+    }
   }
 
   private async removeDirRecursive(dir: string): Promise<void> {
@@ -702,6 +764,44 @@ class PresenceModal extends Modal {
     }
   }
   onClose() { this.contentEl.empty(); }
+}
+
+function attachPresenceBadge(
+  titleEl: HTMLElement,
+  users: Array<{ name: string; color: string; isSelf: boolean }>,
+): void {
+  const badge = document.createElement('span');
+  badge.className = 'cosync-file-presence';
+  badge.style.display = 'inline-flex';
+  badge.style.gap = '2px';
+  badge.style.marginLeft = 'auto';
+  badge.style.paddingLeft = '6px';
+  badge.style.alignItems = 'center';
+  badge.style.flexShrink = '0';
+
+  for (const u of users) {
+    const dot = document.createElement('span');
+    dot.style.width = '8px';
+    dot.style.height = '8px';
+    dot.style.borderRadius = '50%';
+    dot.style.background = u.color;
+    dot.style.display = 'inline-block';
+    dot.style.border = u.isSelf ? '1.5px solid var(--text-normal)' : '1px solid rgba(0,0,0,0.2)';
+    dot.style.boxSizing = 'content-box';
+    dot.title = u.isSelf ? `${u.name} (you)` : u.name;
+    badge.appendChild(dot);
+  }
+
+  // titleEl is the .nav-file-title; make it a flex row so the badge can push
+  // to the right without overflowing the file name.
+  if (!titleEl.style.display) titleEl.style.display = 'flex';
+  if (!titleEl.style.alignItems) titleEl.style.alignItems = 'center';
+  titleEl.appendChild(badge);
+}
+
+function cssEscape(s: string): string {
+  // Minimal CSS attribute selector escape: backslash-escape quotes and backslash.
+  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
 function pickReadableTextColor(hex: string): string {

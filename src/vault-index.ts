@@ -159,6 +159,16 @@ export class VaultIndexSync {
     this.applyLocalUser();
   }
 
+  /**
+   * Publish which file this client currently has open. Other clients listen
+   * to this to decorate the file explorer with the live user's color.
+   * Pass `null` when nothing markdown-y is active.
+   */
+  updateCurrentFile(path: string | null): void {
+    if (!this.provider) return;
+    this.provider.awareness.setLocalStateField('currentFile', path);
+  }
+
   private applyLocalUser(): void {
     if (!this.provider) return;
     const color = this.settings.userColor || '#3eb6f7';
