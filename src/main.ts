@@ -99,10 +99,19 @@ export default class CoSyncPlugin extends Plugin {
     }
     // Eager-push runs in the background: any .md the user has locally but has
     // not opened in this session still gets its content uploaded so other
-    // clients receive non-empty stubs.
-    void this.sync.eagerPushAllFiles().catch((e) => {
-      console.warn('[cosync] eager-push background task failed', e);
-    });
+    // clients receive non-empty stubs. Must wait for onLayoutReady because
+    // app.vault.getMarkdownFiles() is empty until Obsidian has indexed the vault.
+    const runEagerPush = () => {
+      if (!this.sync) return;
+      void this.sync.eagerPushAllFiles().catch((e) => {
+        console.warn('[cosync] eager-push background task failed', e);
+      });
+    };
+    if (this.app.workspace.layoutReady) {
+      runEagerPush();
+    } else {
+      this.app.workspace.onLayoutReady(runEagerPush);
+    }
   }
 
   private async handleFileOpen(file: TFile | null) {

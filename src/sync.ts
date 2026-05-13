@@ -2,7 +2,7 @@
 // One Y.Doc per Markdown file; providers stay open until plugin unload
 // so we remain in the awareness pool of every visited room.
 
-import { App, MarkdownView, Notice, TFile } from 'obsidian';
+import { App, EventRef, MarkdownView, Notice, TFile } from 'obsidian';
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
 import { IndexeddbPersistence } from 'y-indexeddb';
@@ -31,8 +31,49 @@ export class SyncManager {
   private rooms = new Map<string, RoomEntry>();
   private editorCompartment = new WeakMap<EditorView, Compartment>();
   private editorBoundRoom = new WeakMap<EditorView, string>();
+  private renameEventRef: EventRef;
 
-  constructor(private app: App, private settings: CoSyncSettings) {}
+  constructor(private app: App, private settings: CoSyncSettings) {
+    this.renameEventRef = this.app.vault.on('rename', (file, oldPath) => {
+      if (file instanceof TFile && file.extension === 'md') {
+        void this.handleRename(file, oldPath);
+      }
+    });
+  }
+
+  /**
+   * When Obsidian renames a file, the running Y.Doc keeps its old room name
+   * forever otherwise. Drop the old room so the next openRoom() under the new
+   * path creates a fresh Y.Doc and seeds it from disk (Obsidian moves the
+   * file content along during a rename, so disk is the source of truth).
+   */
+  private async handleRename(file: TFile, oldPath: string): Promise<void> {
+    const oldRoom = `${this.settings.vaultId}${ROOM_SEP}${oldPath}`;
+    const entry = this.rooms.get(oldRoom);
+    if (!entry) return;
+
+    console.log(`[cosync] rename: closing ${oldRoom}, will reopen at new path`);
+
+    // Force-flush latest Y.Text content to the new path before tearing down,
+    // covering the (rare) case where the debounced save had not yet fired.
+    if (entry.saveTimer) {
+      clearTimeout(entry.saveTimer);
+      entry.saveTimer = undefined;
+    }
+    try {
+      const text = entry.yText.toString();
+      await this.app.vault.modify(file, text).catch(() => {});
+    } catch { /* best effort */ }
+
+    try {
+      entry.provider.destroy();
+      await entry.idb.destroy().catch(() => {});
+      entry.doc.destroy();
+    } catch (e) {
+      console.warn('[cosync] rename: cleanup error', e);
+    }
+    this.rooms.delete(oldRoom);
+  }
 
   private roomNameFor(file: TFile): string {
     return `${this.settings.vaultId}${ROOM_SEP}${file.path}`;
@@ -211,6 +252,7 @@ export class SyncManager {
 
   /** Tear everything down. Persists a final copy of each room to disk. */
   async closeAll(): Promise<void> {
+    this.app.vault.offref(this.renameEventRef);
     for (const entry of this.rooms.values()) {
       try {
         if (entry.saveTimer) {
