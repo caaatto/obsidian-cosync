@@ -6,7 +6,7 @@
 // Delete is intentionally NOT propagated - removing the index entry when the
 // last user has the file would risk silent data loss. Users delete locally.
 
-import { App, EventRef, TFile } from 'obsidian';
+import { App, EventRef, Notice, TFile } from 'obsidian';
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
 import { IndexeddbPersistence } from 'y-indexeddb';
@@ -118,9 +118,31 @@ export class VaultIndexSync {
           if (!this.app.vault.getAbstractFileByPath(path)) {
             void this.createLocalStub(path);
           }
+        } else if (change.action === 'delete') {
+          void this.handleRemoteDelete(path);
         }
-        // change.action === 'delete' → no local action; users delete by hand.
       }
+    } finally {
+      this.suppressLocalEvents = false;
+    }
+  }
+
+  /**
+   * Mirror a remote file removal onto this client. We move the local file to
+   * the OS trash (vault-relative .trash on platforms without one) rather than
+   * hard-deleting it: the per-file Y.Doc snapshot history on the server has
+   * the content for 30 days, but the local file is what the user actually
+   * sees, so a soft delete gives them a chance to recover by accident.
+   */
+  private async handleRemoteDelete(path: string): Promise<void> {
+    const af = this.app.vault.getAbstractFileByPath(path);
+    if (!(af instanceof TFile)) return;
+    this.suppressLocalEvents = true;
+    try {
+      await this.app.vault.trash(af, true);
+      new Notice(`CoSync: removed "${path}" (moved to trash)`);
+    } catch (e) {
+      console.warn('[cosync] remote delete failed for', path, e);
     } finally {
       this.suppressLocalEvents = false;
     }
