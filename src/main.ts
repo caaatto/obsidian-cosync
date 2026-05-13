@@ -1,7 +1,9 @@
 import { App, MarkdownView, Modal, Notice, Plugin, TFile, WorkspaceLeaf, normalizePath } from 'obsidian';
+import * as Y from 'yjs';
 import { CoSyncSettingTab } from './settings';
 import { SyncManager } from './sync';
 import { VaultIndexSync } from './vault-index';
+import { listHistory, getSnapshot } from './auth-client';
 import {
   CoSyncSettings,
   DEFAULT_SETTINGS,
@@ -33,6 +35,18 @@ export default class CoSyncPlugin extends Plugin {
       id: 'switch-vault',
       name: 'Switch active vault',
       callback: () => new VaultSwitcherModal(this.app, this).open(),
+    });
+
+    this.addCommand({
+      id: 'show-file-history',
+      name: 'Show file history',
+      checkCallback: (checking) => {
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (!view || !view.file) return false;
+        if (isLocalActive(this.settings)) return false;
+        if (!checking) new FileHistoryModal(this.app, this, view.file).open();
+        return true;
+      },
     });
 
     await this.startSyncIfConfigured();
@@ -379,4 +393,162 @@ class VaultSwitcherModal extends Modal {
   onClose() {
     this.contentEl.empty();
   }
+}
+
+class FileHistoryModal extends Modal {
+  private previewEl?: HTMLPreElement;
+
+  constructor(app: App, private plugin: CoSyncPlugin, private file: TFile) {
+    super(app);
+  }
+
+  async onOpen() {
+    this.titleEl.setText(`History: ${this.file.path}`);
+    const { contentEl } = this;
+    contentEl.createEl('p', { text: 'Loading snapshots...', cls: 'setting-item-description' });
+
+    const s = this.plugin.settings;
+    const token = effectiveToken(s);
+    const res = await listHistory(s.serverUrl, token, s.vaultId, this.file.path);
+    contentEl.empty();
+
+    if (!res.ok) {
+      contentEl.createEl('p', { text: `Could not load history: ${res.error}` });
+      return;
+    }
+    if (res.snapshots.length === 0) {
+      contentEl.createEl('p', {
+        text: 'No snapshots yet. The server snapshots active edits every 60 seconds; come back after editing.',
+      });
+      return;
+    }
+
+    const desc = contentEl.createEl('p', {
+      text: `${res.snapshots.length} snapshots available. Click a row to preview, "Restore" to bring that version into the live document.`,
+      cls: 'setting-item-description',
+    });
+    desc.style.marginBottom = '0.5rem';
+
+    const list = contentEl.createDiv();
+    list.style.maxHeight = '240px';
+    list.style.overflowY = 'auto';
+    list.style.border = '1px solid var(--background-modifier-border)';
+    list.style.borderRadius = '4px';
+    list.style.marginBottom = '0.75rem';
+
+    for (const snap of res.snapshots) {
+      const row = list.createDiv();
+      row.style.display = 'flex';
+      row.style.alignItems = 'center';
+      row.style.gap = '0.5rem';
+      row.style.padding = '0.4rem 0.6rem';
+      row.style.borderBottom = '1px solid var(--background-modifier-border)';
+
+      const label = row.createEl('span', { text: formatTimestamp(snap.takenAt) });
+      label.style.flexGrow = '1';
+
+      const sizeLabel = row.createEl('span', {
+        text: `${(snap.byteSize / 1024).toFixed(1)} KB`,
+        cls: 'setting-item-description',
+      });
+      sizeLabel.style.marginRight = '0.5rem';
+
+      const previewBtn = row.createEl('button', { text: 'Preview' });
+      previewBtn.onclick = () => void this.preview(snap.id);
+
+      const restoreBtn = row.createEl('button', { text: 'Restore', cls: 'mod-cta' });
+      restoreBtn.onclick = () => void this.confirmRestore(snap.id, snap.takenAt);
+    }
+
+    this.previewEl = contentEl.createEl('pre');
+    this.previewEl.style.maxHeight = '240px';
+    this.previewEl.style.overflow = 'auto';
+    this.previewEl.style.background = 'var(--background-secondary)';
+    this.previewEl.style.padding = '0.5rem';
+    this.previewEl.style.borderRadius = '4px';
+    this.previewEl.style.display = 'none';
+    this.previewEl.style.fontSize = '0.85em';
+  }
+
+  private async preview(id: number): Promise<void> {
+    const s = this.plugin.settings;
+    const token = effectiveToken(s);
+    const res = await getSnapshot(s.serverUrl, token, id);
+    if (!res.ok) { new Notice(`Preview failed: ${res.error}`); return; }
+    const text = decodeYTextFromUpdate(res.snapshot.state);
+    if (this.previewEl) {
+      this.previewEl.setText(text || '(empty)');
+      this.previewEl.style.display = '';
+      this.previewEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  }
+
+  private async confirmRestore(id: number, takenAt: number): Promise<void> {
+    const filePath = this.file.path;
+    const ok = await new Promise<boolean>((resolve) => {
+      const m = new ConfirmModal(
+        this.app,
+        'Restore this version?',
+        `Replace the current content of "${filePath}" with the version from ${formatTimestamp(takenAt)}. Other users editing live will see this as a single big edit.`,
+        resolve,
+      );
+      m.open();
+    });
+    if (!ok) return;
+    await this.applyRestore(id);
+  }
+
+  private async applyRestore(id: number): Promise<void> {
+    const s = this.plugin.settings;
+    const token = effectiveToken(s);
+    const res = await getSnapshot(s.serverUrl, token, id);
+    if (!res.ok) { new Notice(`Restore failed: ${res.error}`); return; }
+    const text = decodeYTextFromUpdate(res.snapshot.state);
+
+    const sync = this.plugin.sync;
+    if (!sync) { new Notice('CoSync: sync manager not running, cannot restore.'); return; }
+    try {
+      await sync.restoreFileText(this.file, text);
+      new Notice('CoSync: restored.');
+      this.close();
+    } catch (e: any) {
+      new Notice(`Restore failed: ${e?.message || e}`);
+    }
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+function decodeYTextFromUpdate(update: Uint8Array): string {
+  const tmp = new Y.Doc();
+  try {
+    Y.applyUpdate(tmp, update);
+    return tmp.getText('cosync').toString();
+  } finally {
+    tmp.destroy();
+  }
+}
+
+class ConfirmModal extends Modal {
+  private result = false;
+  constructor(app: App, private title: string, private body: string, private onResolve: (v: boolean) => void) {
+    super(app);
+  }
+  onOpen() {
+    this.titleEl.setText(this.title);
+    this.contentEl.createEl('p', { text: this.body });
+    const btns = this.contentEl.createDiv({ cls: 'modal-button-container' });
+    btns.createEl('button', { text: 'Cancel' }).onclick = () => { this.result = false; this.close(); };
+    btns.createEl('button', { text: 'Confirm', cls: 'mod-cta' }).onclick = () => { this.result = true; this.close(); };
+  }
+  onClose() { this.onResolve(this.result); }
+}
+
+function formatTimestamp(ms: number): string {
+  const d = new Date(ms);
+  const date = d.toLocaleDateString();
+  const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  return `${date} ${time}`;
 }

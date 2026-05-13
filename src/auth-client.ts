@@ -107,6 +107,88 @@ export async function logout(serverUrl: string, token: string): Promise<void> {
   } catch { /* ignore, best effort */ }
 }
 
+export interface HistoryEntry { id: number; takenAt: number; byteSize: number }
+
+export interface SnapshotPayload {
+  id: number;
+  vaultId: string;
+  filePath: string;
+  takenAt: number;
+  state: Uint8Array;
+}
+
+export type HistoryListResponse =
+  | { ok: true; snapshots: HistoryEntry[] }
+  | AuthError;
+
+export type SnapshotResponse =
+  | { ok: true; snapshot: SnapshotPayload }
+  | AuthError;
+
+async function getJson(url: string, token: string): Promise<{ status: number; json: any }> {
+  const res = await requestUrl({
+    url,
+    method: 'GET',
+    headers: { Authorization: `Bearer ${token}` },
+    throw: false,
+  });
+  let json: any = {};
+  try { json = res.json; } catch { /* may be empty */ }
+  return { status: res.status, json };
+}
+
+export async function listHistory(
+  serverUrl: string,
+  token: string,
+  vaultId: string,
+  filePath: string,
+): Promise<HistoryListResponse> {
+  if (!token) return { ok: false, status: 401, error: 'not logged in' };
+  try {
+    const u = new URL(`${httpBase(serverUrl)}/history/list`);
+    u.searchParams.set('vault', vaultId);
+    u.searchParams.set('path', filePath);
+    const { status, json } = await getJson(u.toString(), token);
+    if (status === 200 && Array.isArray(json?.snapshots)) {
+      return { ok: true, snapshots: json.snapshots };
+    }
+    return { ok: false, status, error: json?.error || `history list failed (${status})` };
+  } catch (e: any) {
+    return { ok: false, status: 0, error: e?.message || String(e) };
+  }
+}
+
+export async function getSnapshot(
+  serverUrl: string,
+  token: string,
+  id: number,
+): Promise<SnapshotResponse> {
+  if (!token) return { ok: false, status: 401, error: 'not logged in' };
+  try {
+    const u = new URL(`${httpBase(serverUrl)}/history/get`);
+    u.searchParams.set('id', String(id));
+    const { status, json } = await getJson(u.toString(), token);
+    if (status === 200 && typeof json?.state === 'string') {
+      const binary = atob(json.state);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return {
+        ok: true,
+        snapshot: {
+          id: json.id,
+          vaultId: json.vaultId,
+          filePath: json.filePath,
+          takenAt: json.takenAt,
+          state: bytes,
+        },
+      };
+    }
+    return { ok: false, status, error: json?.error || `snapshot get failed (${status})` };
+  } catch (e: any) {
+    return { ok: false, status: 0, error: e?.message || String(e) };
+  }
+}
+
 export async function updateProfile(
   serverUrl: string,
   token: string,

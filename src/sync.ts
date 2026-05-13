@@ -194,6 +194,21 @@ export class SyncManager {
   }
 
   /**
+   * Replace a file's Y.Text content with the given text. Other live editors
+   * will see this as one big edit; the change is broadcast through the
+   * existing provider so it lands on the server too. Caller is expected to
+   * have asked the user for confirmation already.
+   */
+  async restoreFileText(file: TFile, newText: string): Promise<void> {
+    const entry = await this.openRoom(file);
+    entry.doc.transact(() => {
+      if (entry.yText.length > 0) entry.yText.delete(0, entry.yText.length);
+      if (newText.length > 0) entry.yText.insert(0, newText);
+    });
+    // scheduleSave (debounced) will flush the new content back to disk.
+  }
+
+  /**
    * Make sure every local .md has its content on the server. For files that
    * have not been opened in this session (and so have no live room), open a
    * short-lived room, seed Y.Text from disk if it is empty, then close it
