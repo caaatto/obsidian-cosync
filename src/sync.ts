@@ -207,9 +207,11 @@ export class SyncManager {
     const previousDoc = binding.boundDoc.get(cm);
     if (previousDoc === entry.doc) return;
 
-    const docId = entry.doc.guid.slice(0, 8);
-    const prevId = previousDoc?.guid?.slice(0, 8) ?? 'none';
-    console.log(`[cosync] bindEditor file=${entry.filePath} doc=${docId} prev=${prevId}`);
+    // Claim the binding slot synchronously BEFORE any await so that the
+    // file-open + active-leaf-change events that both fire on a note
+    // switch don't each go through the full reconfigure path in parallel.
+    // The second arrival sees boundDoc.get(cm) === entry.doc and returns.
+    binding.boundDoc.set(cm, entry.doc);
 
     const ext = yCollab(entry.yText, entry.awareness, { undoManager: entry.undoMgr });
 
@@ -231,9 +233,6 @@ export class SyncManager {
     const freshComp = new Compartment();
     binding.compartment.set(cm, freshComp);
     cm.dispatch({ effects: StateEffect.appendConfig.of(freshComp.of(ext)) });
-    binding.boundDoc.set(cm, entry.doc);
-
-    console.log(`[cosync] bindEditor: bound doc=${docId}`);
   }
 
   /**
