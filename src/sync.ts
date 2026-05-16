@@ -1,6 +1,11 @@
 // Owns Yjs documents, websocket providers, and CodeMirror bindings.
 // One Y.Doc per Markdown file; providers stay open until plugin unload
 // so we remain in the awareness pool of every visited room.
+//
+// Since 0.10.0 the room name is `vaultId::<docId>`, where docId is an
+// immutable per-note id (see doc-id.ts). The path is no longer part of the
+// room identity, so moving or renaming a note keeps the exact same Y.Doc -
+// no teardown, no re-seed, no chance of inheriting another note's stale room.
 
 import { App, EventRef, MarkdownView, Notice, TFile } from 'obsidian';
 import * as Y from 'yjs';
@@ -11,9 +16,11 @@ import type { Awareness } from 'y-protocols/awareness';
 import { Compartment, StateEffect } from '@codemirror/state';
 import type { EditorView } from '@codemirror/view';
 import { effectiveDisplayName, effectiveToken, type CoSyncSettings } from './types';
+import { injectFrontmatterDocId } from './doc-id';
 
 interface RoomEntry {
   room: string;
+  docId: string;
   filePath: string;
   doc: Y.Doc;
   yText: Y.Text;
@@ -26,6 +33,22 @@ interface RoomEntry {
 
 const ROOM_SEP = '::';
 const SAVE_DEBOUNCE_MS = 1000;
+
+// Fixed Yjs clientID used only for seed updates. Because every client uses the
+// same id, seeding identical text yields a byte-identical Yjs update, so two
+// clients seeding the same fresh room concurrently merge idempotently instead
+// of duplicating the text. Real edits use each doc's own random clientID.
+const SEED_CLIENT_ID = 1;
+
+/** Build the idempotent seed update for a piece of text. */
+function makeSeedUpdate(text: string): Uint8Array {
+  const tmp = new Y.Doc();
+  tmp.clientID = SEED_CLIENT_ID;
+  tmp.getText('cosync').insert(0, text);
+  const update = Y.encodeStateAsUpdate(tmp);
+  tmp.destroy();
+  return update;
+}
 
 export interface EditorBindingState {
   // The plugin owns these so they survive SyncManager replacement on
@@ -46,73 +69,59 @@ export class SyncManager {
   private openingRooms = new Map<string, Promise<RoomEntry>>();
   private renameEventRef: EventRef;
 
-  constructor(private app: App, private settings: CoSyncSettings) {
+  constructor(
+    private app: App,
+    private settings: CoSyncSettings,
+    // Resolves a file to its immutable docId (owned by VaultIndexSync).
+    private resolveDocId: (file: TFile) => Promise<string>,
+  ) {
     this.renameEventRef = this.app.vault.on('rename', (file, oldPath) => {
       if (file instanceof TFile && file.extension === 'md') {
-        void this.handleRename(file, oldPath);
+        this.handleRename(file, oldPath);
       }
     });
   }
 
   /**
-   * When Obsidian renames a file, the running Y.Doc keeps its old room name
-   * forever otherwise. Drop the old room so the next openRoom() under the new
-   * path creates a fresh Y.Doc and seeds it from disk (Obsidian moves the
-   * file content along during a rename, so disk is the source of truth).
+   * A rename/move no longer changes the room: the room is keyed by the
+   * immutable docId, not the path. We only need to retarget where the
+   * debounced disk save writes. The Y.Doc, provider and editor binding all
+   * stay exactly as they are - the note keeps its content and history.
    */
-  private async handleRename(file: TFile, oldPath: string): Promise<void> {
-    const oldRoom = `${this.settings.vaultId}${ROOM_SEP}${oldPath}`;
-    const entry = this.rooms.get(oldRoom);
-    if (!entry) return;
-
-    console.log(`[cosync] rename: closing ${oldRoom}, will reopen at new path`);
-
-    // Force-flush latest Y.Text content to the new path before tearing down,
-    // covering the (rare) case where the debounced save had not yet fired.
-    if (entry.saveTimer) {
-      clearTimeout(entry.saveTimer);
-      entry.saveTimer = undefined;
+  private handleRename(file: TFile, oldPath: string): void {
+    for (const entry of this.rooms.values()) {
+      if (entry.filePath === oldPath) {
+        entry.filePath = file.path;
+        console.log(`[cosync] rename: ${oldPath} -> ${file.path} (room ${entry.docId} unchanged)`);
+        return;
+      }
     }
-    try {
-      const text = entry.yText.toString();
-      await this.app.vault.modify(file, text).catch(() => {});
-    } catch { /* best effort */ }
-
-    try {
-      entry.provider.destroy();
-      await entry.idb.destroy().catch(() => {});
-      entry.doc.destroy();
-    } catch (e) {
-      console.warn('[cosync] rename: cleanup error', e);
-    }
-    this.rooms.delete(oldRoom);
   }
 
-  private roomNameFor(file: TFile): string {
-    return `${this.settings.vaultId}${ROOM_SEP}${file.path}`;
-  }
-
-  private filePathFromRoom(room: string): string {
-    const idx = room.indexOf(ROOM_SEP);
-    return idx >= 0 ? room.slice(idx + ROOM_SEP.length) : room;
+  private roomNameFor(docId: string): string {
+    return `${this.settings.vaultId}${ROOM_SEP}${docId}`;
   }
 
   /** Open (or return existing) room for a file. Awaits initial IDB sync. */
-  async openRoom(file: TFile): Promise<RoomEntry> {
-    const room = this.roomNameFor(file);
+  async openRoom(file: TFile, docId: string): Promise<RoomEntry> {
+    const room = this.roomNameFor(docId);
     const existing = this.rooms.get(room);
-    if (existing) return existing;
+    if (existing) {
+      // Keep the save target current in case the file was moved while open.
+      existing.filePath = file.path;
+      return existing;
+    }
     const inflight = this.openingRooms.get(room);
     if (inflight) return inflight;
 
-    const promise = this.createRoom(file, room).finally(() => {
+    const promise = this.createRoom(file, room, docId).finally(() => {
       this.openingRooms.delete(room);
     });
     this.openingRooms.set(room, promise);
     return promise;
   }
 
-  private async createRoom(file: TFile, room: string): Promise<RoomEntry> {
+  private async createRoom(file: TFile, room: string, docId: string): Promise<RoomEntry> {
     const doc = new Y.Doc();
     const yText = doc.getText('cosync');
     const undoMgr = new Y.UndoManager(yText);
@@ -139,6 +148,7 @@ export class SyncManager {
 
     const entry: RoomEntry = {
       room,
+      docId,
       filePath: file.path,
       doc,
       yText,
@@ -149,18 +159,23 @@ export class SyncManager {
     };
     this.rooms.set(room, entry);
 
-    // First-time seed: if Y.Text is empty after server+IDB sync, fill with file contents.
+    // First-time seed: if Y.Text is still empty after server + IDB sync, fill
+    // it from disk. The seed runs through makeSeedUpdate (fixed clientID), so
+    // even if another client seeds the same fresh room at the same instant the
+    // two updates are identical and merge without duplicating anything. We also
+    // make sure the note's frontmatter carries its cosync-id.
     provider.once('synced', async () => {
-      if (yText.length === 0) {
-        try {
-          const text = await this.app.vault.read(file);
-          if (text.length > 0) {
-            doc.transact(() => yText.insert(0, text));
-          }
-        } catch (e) {
-          console.error('[cosync] initial seed read failed', e);
-        }
+      if (yText.length > 0) return;
+      let text: string;
+      try {
+        text = await this.app.vault.read(file);
+      } catch (e) {
+        console.error('[cosync] initial seed read failed', e);
+        return;
       }
+      if (yText.length > 0) return; // content arrived while we were reading
+      const seeded = injectFrontmatterDocId(text, docId);
+      Y.applyUpdate(doc, makeSeedUpdate(seeded));
     });
 
     // Push merged CRDT state back to disk so Obsidian's search/graph stays current.
@@ -269,8 +284,8 @@ export class SyncManager {
    * existing provider so it lands on the server too. Caller is expected to
    * have asked the user for confirmation already.
    */
-  async restoreFileText(file: TFile, newText: string): Promise<void> {
-    const entry = await this.openRoom(file);
+  async restoreFileText(file: TFile, docId: string, newText: string): Promise<void> {
+    const entry = await this.openRoom(file, docId);
     entry.doc.transact(() => {
       if (entry.yText.length > 0) entry.yText.delete(0, entry.yText.length);
       if (newText.length > 0) entry.yText.insert(0, newText);
@@ -292,16 +307,20 @@ export class SyncManager {
     const files = this.app.vault.getMarkdownFiles();
     console.log(`[cosync] eager-push: ${files.length} files`);
     for (const f of files) {
-      const room = this.roomNameFor(f);
+      let docId: string;
+      try {
+        docId = await this.resolveDocId(f);
+      } catch (e) {
+        console.warn('[cosync] eager-push: docId resolve failed for', f.path, e);
+        continue;
+      }
+      const room = this.roomNameFor(docId);
       // Skip if a live room is already open OR a concurrent openRoom is in
-      // flight. Running eagerSeedOne against the same room while openRoom is
-      // also creating a Y.Doc for it caused duplicate Y.Docs to sync to the
-      // server, producing the asymmetric-sync symptom (one side's updates
-      // referenced state the other side had no idea about).
+      // flight. (Even if this races, the seed is idempotent - see createRoom.)
       if (this.rooms.has(room)) continue;
       if (this.openingRooms.has(room)) continue;
       try {
-        await this.eagerSeedOne(f, room, wsUrl, token);
+        await this.eagerSeedOne(f, room, docId, wsUrl, token);
       } catch (e) {
         console.warn('[cosync] eager-push failed for', f.path, e);
       }
@@ -316,7 +335,13 @@ export class SyncManager {
    * corrupted the locally-loaded state on subsequent loads. Server is the
    * source of truth here anyway - we only need the WebSocket transport.
    */
-  private async eagerSeedOne(file: TFile, room: string, wsUrl: string, token: string): Promise<void> {
+  private async eagerSeedOne(
+    file: TFile,
+    room: string,
+    docId: string,
+    wsUrl: string,
+    token: string,
+  ): Promise<void> {
     const doc = new Y.Doc();
     const yText = doc.getText('cosync');
 
@@ -332,9 +357,10 @@ export class SyncManager {
       });
 
       if (yText.length === 0) {
-        const content = await this.app.vault.read(file);
-        if (content.length > 0) {
-          doc.transact(() => yText.insert(0, content));
+        const raw = await this.app.vault.read(file);
+        if (yText.length === 0) {
+          const seeded = injectFrontmatterDocId(raw, docId);
+          Y.applyUpdate(doc, makeSeedUpdate(seeded));
           // Give the provider a beat to flush the update to the server.
           await new Promise((r) => setTimeout(r, 150));
         }

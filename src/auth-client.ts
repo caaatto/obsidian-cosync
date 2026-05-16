@@ -141,13 +141,15 @@ export async function listHistory(
   serverUrl: string,
   token: string,
   vaultId: string,
-  filePath: string,
+  docId: string,
 ): Promise<HistoryListResponse> {
   if (!token) return { ok: false, status: 401, error: 'not logged in' };
   try {
     const u = new URL(`${httpBase(serverUrl)}/history/list`);
     u.searchParams.set('vault', vaultId);
-    u.searchParams.set('path', filePath);
+    // The server keys snapshots by room name; for per-file rooms that is the
+    // docId. The query param stays named `path` for server compatibility.
+    u.searchParams.set('path', docId);
     const { status, json } = await getJson(u.toString(), token);
     if (status === 200 && Array.isArray(json?.snapshots)) {
       return { ok: true, snapshots: json.snapshots };

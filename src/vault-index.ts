@@ -18,6 +18,7 @@ import { WebsocketProvider } from 'y-websocket';
 import { IndexeddbPersistence } from 'y-indexeddb';
 import type { Awareness } from 'y-protocols/awareness';
 import { effectiveDisplayName, effectiveToken, type CoSyncSettings } from './types';
+import { generateDocId, migrationDocId, parseFrontmatterDocId } from './doc-id';
 
 const INDEX_ROOM_KEY = '__INDEX__';
 
@@ -26,6 +27,9 @@ interface FileEntry {
   exists?: true;
   // Unix-ms timestamp; if set, this path is tombstoned (deleted).
   deletedAt?: number;
+  // Immutable per-note id (0.10+). The Yjs room is `vaultId::<docId>`, so the
+  // id - not the path - decides which room a note belongs to. Survives moves.
+  docId?: string;
 }
 
 interface FolderEntry {
@@ -79,7 +83,7 @@ export class VaultIndexSync {
     });
     this.applyLocalUser();
 
-    this.provider.once('synced', () => this.reconcileAfterSync());
+    this.provider.once('synced', () => void this.reconcileAfterSync());
     files.observe((event) => this.onRemoteFileChange(event));
     folders.observe((event) => this.onRemoteFolderChange(event));
 
@@ -107,9 +111,13 @@ export class VaultIndexSync {
       if (af instanceof TFile && af.extension === 'md') {
         const fmap = this.files;
         if (!fmap) return;
+        // Carry the SAME docId from old to new path: a move keeps the note's
+        // identity (and its Yjs room), it does not create a new note.
+        const prev = fmap.get(oldPath);
+        const docId = prev?.docId ?? migrationDocId(this.settings.vaultId, oldPath);
         doc.transact(() => {
-          fmap.set(oldPath, { deletedAt: Date.now() });
-          fmap.set(af.path, {});
+          fmap.set(oldPath, { docId, deletedAt: Date.now() });
+          fmap.set(af.path, { docId });
         });
         return;
       }
@@ -135,12 +143,18 @@ export class VaultIndexSync {
     }));
   }
 
-  /** Insert / un-tombstone a path. Idempotent if the path is already alive. */
+  /**
+   * Register a freshly created local note in the index. A brand-new note - or
+   * a note created at a path some earlier note used and abandoned - always
+   * gets a FRESH random docId, so it can never inherit a stale room. Idempotent
+   * if the path is already alive with an id (e.g. a duplicate create event).
+   */
   private markFileAlive(path: string) {
     const map = this.files;
     if (!map) return;
-    if (isFileAlive(map.get(path))) return;
-    map.set(path, {});
+    const existing = map.get(path);
+    if (isFileAlive(existing) && existing!.docId) return;
+    map.set(path, { docId: generateDocId() });
   }
 
   private markFolderAlive(path: string) {
@@ -150,7 +164,51 @@ export class VaultIndexSync {
     map.set(path, {});
   }
 
-  private reconcileAfterSync() {
+  /**
+   * Resolve the immutable docId for a note. Order of precedence:
+   *   1. the `cosync-id` line in the note's frontmatter (primary, durable);
+   *   2. the vault index (fallback - mirrors the frontmatter);
+   *   3. a deterministic migration id derived from vaultId + path, so a note
+   *      that predates docId tracking converges on the same room on every
+   *      client without any coordination.
+   * The resolved id is mirrored back into the index for fast future lookups.
+   */
+  async resolveDocId(file: TFile): Promise<string> {
+    let content = '';
+    try { content = await this.app.vault.read(file); } catch { /* new/unreadable */ }
+
+    const fromFrontmatter = parseFrontmatterDocId(content);
+    if (fromFrontmatter) {
+      this.adoptDocId(file.path, fromFrontmatter);
+      return fromFrontmatter;
+    }
+
+    // A stored id (even on a tombstoned entry) still identifies the same note.
+    const indexed = this.files?.get(file.path);
+    if (indexed?.docId) return indexed.docId;
+
+    const docId = migrationDocId(this.settings.vaultId, file.path);
+    this.adoptDocId(file.path, docId);
+    return docId;
+  }
+
+  /** docId currently recorded in the index for a path, if any. */
+  getDocId(path: string): string | undefined {
+    return this.files?.get(path)?.docId;
+  }
+
+  /** Write a docId into the index for a path without changing its alive/dead state. */
+  private adoptDocId(path: string, docId: string): void {
+    const map = this.files;
+    if (!map) return;
+    const e = map.get(path);
+    if (e?.docId === docId) return;
+    const next: FileEntry = { docId };
+    if (e?.deletedAt) next.deletedAt = e.deletedAt;
+    map.set(path, next);
+  }
+
+  private async reconcileAfterSync() {
     const files = this.files;
     const folders = this.folders;
     if (!files || !folders) return;
@@ -175,23 +233,25 @@ export class VaultIndexSync {
       }
     }
 
-    // 2a) Reconcile local files with index.
+    // 2a) Reconcile local files with index. Every alive local file must end up
+    //     with a stable docId in the index.
     for (const f of this.app.vault.getMarkdownFiles()) {
       const entry = files.get(f.path);
-      if (!entry) {
-        files.set(f.path, {});
-        continue;
-      }
-      if (!isFileAlive(entry)) {
+      if (entry && !isFileAlive(entry)) {
         const mtime = f.stat?.mtime ?? 0;
-        const deletedAt = entry.deletedAt ?? 0;
-        if (mtime > deletedAt) {
-          // Offline edits after the delete: bring the file back.
-          files.set(f.path, {});
-        } else {
+        if (mtime <= (entry.deletedAt ?? 0)) {
           // Stale local copy: trash, the remote delete wins.
           void this.handleRemoteFileDelete(f.path);
+          continue;
         }
+        // Offline edits after the delete: fall through and resurrect below.
+      }
+      // Already a clean alive entry with an id - nothing to do, skip the disk
+      // read. Otherwise resolve (frontmatter / migration id) and publish.
+      if (entry && isFileAlive(entry) && entry.docId) continue;
+      const docId = await this.resolveDocId(f);
+      if (!isFileAlive(files.get(f.path))) {
+        files.set(f.path, { docId });
       }
     }
 

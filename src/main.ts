@@ -6,6 +6,7 @@ import { CoSyncSettingTab } from './settings';
 import { SyncManager, type EditorBindingState } from './sync';
 import { VaultIndexSync } from './vault-index';
 import { listHistory, getSnapshot } from './auth-client';
+import { migrationDocId } from './doc-id';
 import {
   CoSyncSettings,
   DEFAULT_SETTINGS,
@@ -187,8 +188,10 @@ export default class CoSyncPlugin extends Plugin {
       console.warn('[cosync] not started: vault id missing');
       return;
     }
-    this.sync = new SyncManager(this.app, this.settings);
+    // VaultIndexSync owns the path -> docId mapping; SyncManager needs it to
+    // resolve which room a file belongs to, so create the index first.
     this.vaultIndex = new VaultIndexSync(this.app, this.settings);
+    this.sync = new SyncManager(this.app, this.settings, (file) => this.resolveDocId(file));
     try {
       await this.vaultIndex.start();
       this.attachPresenceListener();
@@ -233,11 +236,22 @@ export default class CoSyncPlugin extends Plugin {
     }
     this.broadcastCurrentFile(view.file.path);
     try {
-      const entry = await this.sync.openRoom(view.file);
+      const docId = await this.resolveDocId(view.file);
+      const entry = await this.sync.openRoom(view.file, docId);
       await this.sync.bindEditor(view, entry, this.editorBinding);
     } catch (e) {
       console.error('[cosync] bindCurrentLeaf failed', e);
     }
+  }
+
+  /**
+   * Resolve a note's immutable docId. Delegates to VaultIndexSync (frontmatter
+   * + index); only falls back to a bare deterministic id if the index is not
+   * running, which should not happen while sync is active.
+   */
+  resolveDocId(file: TFile): Promise<string> {
+    if (this.vaultIndex) return this.vaultIndex.resolveDocId(file);
+    return Promise.resolve(migrationDocId(this.settings.vaultId, file.path));
   }
 
   private broadcastCurrentFile(path: string | null) {
@@ -693,6 +707,7 @@ class VaultSwitcherModal extends Modal {
 
 class FileHistoryModal extends Modal {
   private previewEl?: HTMLPreElement;
+  private docId = '';
 
   constructor(app: App, private plugin: CoSyncPlugin, private file: TFile) {
     super(app);
@@ -703,9 +718,12 @@ class FileHistoryModal extends Modal {
     const { contentEl } = this;
     contentEl.createEl('p', { text: 'Loading snapshots...', cls: 'setting-item-description' });
 
+    // History is keyed by the immutable docId (the server room name), not the
+    // path - so a note's history survives moves and renames.
+    this.docId = await this.plugin.resolveDocId(this.file);
     const s = this.plugin.settings;
     const token = effectiveToken(s);
-    const res = await listHistory(s.serverUrl, token, s.vaultId, this.file.path);
+    const res = await listHistory(s.serverUrl, token, s.vaultId, this.docId);
     contentEl.empty();
 
     if (!res.ok) {
@@ -804,7 +822,7 @@ class FileHistoryModal extends Modal {
     const sync = this.plugin.sync;
     if (!sync) { new Notice('CoSync: sync manager not running, cannot restore.'); return; }
     try {
-      await sync.restoreFileText(this.file, text);
+      await sync.restoreFileText(this.file, this.docId, text);
       new Notice('CoSync: restored.');
       this.close();
     } catch (e: any) {
