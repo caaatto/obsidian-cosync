@@ -3,7 +3,7 @@ import * as Y from 'yjs';
 import type { Compartment } from '@codemirror/state';
 import type { EditorView } from '@codemirror/view';
 import { CoSyncSettingTab } from './settings';
-import { SyncManager, type EditorBindingState } from './sync';
+import { SyncManager, unbindAllEditors, type EditorBindingState } from './sync';
 import { VaultIndexSync } from './vault-index';
 import { listHistory, getSnapshot } from './auth-client';
 import { migrationDocId } from './doc-id';
@@ -38,10 +38,14 @@ export default class CoSyncPlugin extends Plugin {
   private editorBinding: EditorBindingState = {
     compartment: new WeakMap<EditorView, Compartment>(),
     boundDoc: new WeakMap<EditorView, Y.Doc>(),
+    editors: new Set<EditorView>(),
   };
   private statusBarEl: HTMLElement | null = null;
   private presenceAwarenessListener: (() => void) | null = null;
   private currentActiveFile: string | null = null;
+  // Serializes bindCurrentLeaf so concurrent file-open / leaf-change events
+  // cannot interleave two bindEditor calls onto the same editor.
+  private bindChain: Promise<void> = Promise.resolve();
 
   async onload() {
     // Defensive: if a previous plugin instance is still mounted in this
@@ -120,6 +124,10 @@ export default class CoSyncPlugin extends Plugin {
   }
 
   async onunload() {
+    // Detach our yCollab extension from every editor FIRST. If this instance
+    // is being torn down by a hot reload, this is what prevents the dead
+    // binding from running an edit loop alongside the new instance.
+    unbindAllEditors(this.editorBinding);
     await this.stopSync();
     document.querySelectorAll('.cosync-file-presence').forEach((el) => el.remove());
     document.body.style.removeProperty('--cosync-self-cursor-color');
@@ -224,7 +232,21 @@ export default class CoSyncPlugin extends Plugin {
     await this.bindCurrentLeaf();
   }
 
-  private async bindCurrentLeaf() {
+  /**
+   * Serialized entry point for editor binding. A note switch fires file-open
+   * AND active-leaf-change almost simultaneously; chaining the calls
+   * guarantees one bindEditor finishes (and claims its compartment) before the
+   * next begins, so two yCollab extensions can never interleave onto one
+   * editor.
+   */
+  private bindCurrentLeaf(): Promise<void> {
+    this.bindChain = this.bindChain
+      .catch(() => { /* keep the chain alive */ })
+      .then(() => this.doBindCurrentLeaf());
+    return this.bindChain;
+  }
+
+  private async doBindCurrentLeaf() {
     if (!this.sync) {
       this.broadcastCurrentFile(null);
       return;

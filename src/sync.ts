@@ -13,7 +13,7 @@ import { WebsocketProvider } from 'y-websocket';
 import { IndexeddbPersistence } from 'y-indexeddb';
 import { yCollab } from 'y-codemirror.next';
 import type { Awareness } from 'y-protocols/awareness';
-import { Compartment, StateEffect } from '@codemirror/state';
+import { Compartment, EditorState, StateEffect, type Extension } from '@codemirror/state';
 import type { EditorView } from '@codemirror/view';
 import { effectiveDisplayName, effectiveToken, type CoSyncSettings } from './types';
 import { injectFrontmatterDocId } from './doc-id';
@@ -50,6 +50,71 @@ function makeSeedUpdate(text: string): Uint8Array {
   return update;
 }
 
+/**
+ * Minimal single-range replacement that turns `before` into `after`: trim the
+ * common prefix and suffix, the rest is the actual edit. O(n), and for an edit
+ * that touched one region it is the truly minimal diff.
+ */
+function minimalReplace(
+  before: string,
+  after: string,
+): { from: number; to: number; insert: string } | null {
+  if (before === after) return null;
+  let p = 0;
+  const maxP = Math.min(before.length, after.length);
+  while (p < maxP && before.charCodeAt(p) === after.charCodeAt(p)) p++;
+  let s = 0;
+  const maxS = Math.min(before.length - p, after.length - p);
+  while (
+    s < maxS &&
+    before.charCodeAt(before.length - 1 - s) === after.charCodeAt(after.length - 1 - s)
+  ) s++;
+  return { from: p, to: before.length - s, insert: after.slice(p, after.length - s) };
+}
+
+/**
+ * Per-editor CodeMirror transaction filter that defuses external-edit
+ * corruption.
+ *
+ * When an external program edits a note's .md while it is open, Obsidian
+ * reloads the editor with ONE transaction that deletes the whole document and
+ * re-inserts the new content. yCollab would turn that into a delete-all +
+ * insert-all on the Y.Text - and a full re-insert cannot merge with the
+ * server's concurrent copy (Yjs sees brand-new ops, not "the same text"), so
+ * the note duplicates, multiplied by every offline edit that piled up.
+ *
+ * The filter re-expresses any transaction that wipes out at least half the
+ * document as the minimal prefix/suffix-trimmed replacement, so yCollab emits
+ * granular ops that merge cleanly, exactly like a normal keyboard edit.
+ *
+ * Two things are deliberately left alone:
+ *  - small edits (normal typing, find/replace, multi-cursor) - below threshold;
+ *  - transactions that make the editor MATCH the Y.Text - that is yCollab
+ *    rendering a remote change (or the initial bind sync). Those are already
+ *    granular; re-touching them would break yCollab's own echo handling. We
+ *    detect them by comparing the resulting doc against the live Y.Text
+ *    instead of relying on yCollab-internal annotations.
+ */
+function reloadMinimizer(entry: RoomEntry): Extension {
+  return EditorState.transactionFilter.of((tr) => {
+    if (!tr.docChanged) return tr;
+    const beforeLen = tr.startState.doc.length;
+    if (beforeLen === 0) return tr;
+
+    let deleted = 0;
+    tr.changes.iterChanges((fromA, toA) => { deleted += toA - fromA; });
+    if (deleted < beforeLen / 2) return tr; // ordinary edit, not a bulk rewrite
+
+    const after = tr.newDoc.toString();
+    if (after === entry.yText.toString()) return tr; // yCollab catching up to Y
+
+    const minimal = minimalReplace(tr.startState.doc.toString(), after);
+    // No net change, or already minimal (the latter also stops any refilter).
+    if (!minimal || minimal.to - minimal.from >= deleted) return tr;
+    return { changes: minimal };
+  });
+}
+
 export interface EditorBindingState {
   // The plugin owns these so they survive SyncManager replacement on
   // saveSettings. Otherwise each settings change would append a new yCollab
@@ -57,6 +122,31 @@ export interface EditorBindingState {
   // destroyed Y.Docs.
   compartment: WeakMap<EditorView, Compartment>;
   boundDoc: WeakMap<EditorView, Y.Doc>;
+  // Every editor we have ever bound. WeakMaps cannot be enumerated, but on
+  // plugin unload we MUST be able to walk every editor and strip our yCollab
+  // extension - otherwise a hot reload (BRAT update) leaves the dead
+  // instance's binding in the editor next to the new instance's, and the two
+  // feed each other an endless edit loop.
+  editors: Set<EditorView>;
+}
+
+/**
+ * Strip the cosync yCollab compartment from every editor this binding state
+ * touched. Called on plugin unload so a replaced/reloaded instance never
+ * leaves a live binding behind.
+ */
+export function unbindAllEditors(binding: EditorBindingState): void {
+  for (const cm of binding.editors) {
+    const comp = binding.compartment.get(cm);
+    if (comp) {
+      try {
+        cm.dispatch({ effects: comp.reconfigure([]) });
+      } catch { /* editor already destroyed - nothing to detach */ }
+    }
+    binding.compartment.delete(cm);
+    binding.boundDoc.delete(cm);
+  }
+  binding.editors.clear();
 }
 
 export class SyncManager {
@@ -216,6 +306,9 @@ export class SyncManager {
       new Notice('[cosync] could not access CodeMirror editor');
       return;
     }
+    // Remember this editor so unbindAllEditors() can strip our extension from
+    // it on unload.
+    binding.editors.add(cm);
     // Always (re-)apply the local caret color, even on idempotent calls.
     this.applySelfCursorColor(cm);
 
@@ -228,7 +321,10 @@ export class SyncManager {
     // The second arrival sees boundDoc.get(cm) === entry.doc and returns.
     binding.boundDoc.set(cm, entry.doc);
 
-    const ext = yCollab(entry.yText, entry.awareness, { undoManager: entry.undoMgr });
+    const ext = [
+      reloadMinimizer(entry),
+      yCollab(entry.yText, entry.awareness, { undoManager: entry.undoMgr }),
+    ];
 
     // y-codemirror.next's YSyncPluginValue captures `this.conf.ytext` ONCE
     // in its constructor and only unobserves on destroy(). When we change

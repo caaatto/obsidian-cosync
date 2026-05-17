@@ -1,6 +1,6 @@
 {
   "name": "obsidian-cosync",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "description": "Live collaborative editing for Obsidian via Yjs CRDT and a self-hosted sync server.",
   "main": "main.js",
   "scripts": {
