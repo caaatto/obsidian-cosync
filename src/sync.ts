@@ -34,16 +34,35 @@ interface RoomEntry {
 const ROOM_SEP = '::';
 const SAVE_DEBOUNCE_MS = 1000;
 
-// Fixed Yjs clientID used only for seed updates. Because every client uses the
-// same id, seeding identical text yields a byte-identical Yjs update, so two
-// clients seeding the same fresh room concurrently merge idempotently instead
-// of duplicating the text. Real edits use each doc's own random clientID.
-const SEED_CLIENT_ID = 1;
+/**
+ * FNV-1a hash of the text, folded into a stable 31-bit Yjs clientID.
+ *
+ * Seed updates derive their clientID from their CONTENT, not a fixed value:
+ *  - two clients seeding *identical* text get the same clientID, so their
+ *    updates are byte-identical and merge idempotently (no duplication);
+ *  - two clients seeding *different* text get different clientIDs, so their
+ *    items live in disjoint (client, clock) ranges and merge into a clean,
+ *    recoverable double instead of colliding on shared ids and corrupting the
+ *    document.
+ *
+ * A fixed clientID (0.10.0-0.10.1) was wrong: two clients seeding even
+ * slightly different text - e.g. one note copy already carried the cosync-id
+ * frontmatter and the other did not - claimed the same (client, clock) ids for
+ * different content, which Yjs cannot represent, so the frontmatter region got
+ * mangled and re-duplicated on every following sync.
+ */
+function seedClientId(text: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h = Math.imul(h ^ text.charCodeAt(i), 0x01000193);
+  }
+  return (h >>> 0) % 0x7fffffff;
+}
 
-/** Build the idempotent seed update for a piece of text. */
+/** Build the content-addressed seed update for a piece of text. */
 function makeSeedUpdate(text: string): Uint8Array {
   const tmp = new Y.Doc();
-  tmp.clientID = SEED_CLIENT_ID;
+  tmp.clientID = seedClientId(text);
   tmp.getText('cosync').insert(0, text);
   const update = Y.encodeStateAsUpdate(tmp);
   tmp.destroy();
@@ -256,6 +275,10 @@ export class SyncManager {
     // make sure the note's frontmatter carries its cosync-id.
     provider.once('synced', async () => {
       if (yText.length > 0) return;
+      // Grace period: if a peer is seeding this same fresh room right now, let
+      // their update land first so we do not add a second, divergent copy.
+      await new Promise((r) => setTimeout(r, 600));
+      if (yText.length > 0) return;
       let text: string;
       try {
         text = await this.app.vault.read(file);
@@ -286,6 +309,13 @@ export class SyncManager {
     entry.saveTimer = setTimeout(async () => {
       const f = this.app.vault.getAbstractFileByPath(entry.filePath);
       if (!(f instanceof TFile)) return;
+      // Never write a file that is open in an editor. Obsidian persists the
+      // open editor itself, and yCollab already keeps that editor in sync with
+      // the Y.Text. A second writer (us, via vault.modify) makes Obsidian think
+      // the file changed underneath it - "modified externally, merging
+      // automatically" - and that merge feeds an endless re-copy loop. We only
+      // persist notes that are NOT open: pool rooms receiving remote updates.
+      if (this.isFileOpenInEditor(entry.filePath)) return;
       const content = entry.yText.toString();
       try {
         await this.app.vault.modify(f, content);
@@ -293,6 +323,14 @@ export class SyncManager {
         console.error('[cosync] modify failed', e);
       }
     }, SAVE_DEBOUNCE_MS);
+  }
+
+  /** True if the given vault path is currently shown in any Markdown editor. */
+  private isFileOpenInEditor(path: string): boolean {
+    return this.app.workspace.getLeavesOfType('markdown').some((leaf) => {
+      const view = leaf.view as MarkdownView | undefined;
+      return view?.file?.path === path;
+    });
   }
 
   /**
