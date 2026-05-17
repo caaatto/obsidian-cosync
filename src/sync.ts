@@ -33,6 +33,7 @@ interface RoomEntry {
 
 const ROOM_SEP = '::';
 const SAVE_DEBOUNCE_MS = 1000;
+const EXTERNAL_INGEST_DEBOUNCE_MS = 800;
 
 /**
  * FNV-1a hash of the text, folded into a stable 31-bit Yjs clientID.
@@ -177,6 +178,11 @@ export class SyncManager {
   // disconnect/reconnect loop.
   private openingRooms = new Map<string, Promise<RoomEntry>>();
   private renameEventRef: EventRef;
+  private modifyEventRef: EventRef;
+  // Debounce timers for external-edit ingestion, keyed by file path.
+  private externalIngestTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  // Paths whose external-edit ingestion is currently running (short-lived room).
+  private ingesting = new Set<string>();
 
   constructor(
     private app: App,
@@ -187,6 +193,13 @@ export class SyncManager {
     this.renameEventRef = this.app.vault.on('rename', (file, oldPath) => {
       if (file instanceof TFile && file.extension === 'md') {
         this.handleRename(file, oldPath);
+      }
+    });
+    // External edits (VS Code, scripts, AI agents) land on disk without going
+    // through the editor. Watch for them and merge them into the Y.Text.
+    this.modifyEventRef = this.app.vault.on('modify', (file) => {
+      if (file instanceof TFile && file.extension === 'md') {
+        this.queueExternalIngest(file);
       }
     });
   }
@@ -237,6 +250,10 @@ export class SyncManager {
 
     const idb = new IndexeddbPersistence(room, doc);
     await idb.whenSynced;
+    // Content this client last had locally (from IndexedDB), captured before
+    // the server sync. Used to tell an external .md edit ("disk != base") from
+    // a merely-stale disk ("disk == base, server just has newer content").
+    const base = yText.toString();
 
     const wsUrl = this.settings.serverUrl.replace(/\/+$/, '');
     const token = effectiveToken(this.settings);
@@ -268,27 +285,36 @@ export class SyncManager {
     };
     this.rooms.set(room, entry);
 
-    // First-time seed: if Y.Text is still empty after server + IDB sync, fill
-    // it from disk. The seed runs through makeSeedUpdate (fixed clientID), so
-    // even if another client seeds the same fresh room at the same instant the
-    // two updates are identical and merge without duplicating anything. We also
-    // make sure the note's frontmatter carries its cosync-id.
+    // After the first server + IDB sync, reconcile the room with the .md file:
+    //  - empty room  -> seed it from disk;
+    //  - non-empty   -> if the file was edited externally while this note was
+    //    closed (disk differs from `base`, the content we last had locally),
+    //    merge that change in as a granular diff. If disk still equals `base`
+    //    the server just has newer content - leave it, scheduleSave writes it.
     provider.once('synced', async () => {
-      if (yText.length > 0) return;
-      // Grace period: if a peer is seeding this same fresh room right now, let
-      // their update land first so we do not add a second, divergent copy.
-      await new Promise((r) => setTimeout(r, 600));
-      if (yText.length > 0) return;
-      let text: string;
-      try {
-        text = await this.app.vault.read(file);
-      } catch (e) {
-        console.error('[cosync] initial seed read failed', e);
+      if (yText.length === 0) {
+        // Grace period: let a peer seeding the same fresh room win first.
+        await new Promise((r) => setTimeout(r, 600));
+        if (yText.length > 0) return;
+        let raw: string;
+        try {
+          raw = await this.app.vault.read(file);
+        } catch (e) {
+          console.error('[cosync] initial seed read failed', e);
+          return;
+        }
+        this.seedFromDisk(doc, yText, raw, docId);
         return;
       }
-      if (yText.length > 0) return; // content arrived while we were reading
-      const seeded = injectFrontmatterDocId(text, docId);
-      Y.applyUpdate(doc, makeSeedUpdate(seeded));
+      if (base.length === 0) return; // no reliable base - trust the server
+      let raw: string;
+      try {
+        raw = await this.app.vault.read(file);
+      } catch {
+        return;
+      }
+      if (raw === base) return; // disk untouched since last local sync
+      this.mergeDiskEdit(doc, yText, raw, docId);
     });
 
     // Push merged CRDT state back to disk so Obsidian's search/graph stays current.
@@ -331,6 +357,113 @@ export class SyncManager {
       const view = leaf.view as MarkdownView | undefined;
       return view?.file?.path === path;
     });
+  }
+
+  /** Seed an empty room from disk content. No-op if the Y.Text is non-empty. */
+  private seedFromDisk(doc: Y.Doc, yText: Y.Text, raw: string, docId: string): boolean {
+    if (yText.length > 0) return false;
+    Y.applyUpdate(doc, makeSeedUpdate(injectFrontmatterDocId(raw, docId)));
+    return true;
+  }
+
+  /**
+   * Merge an external edit (`raw` = current disk content) into a non-empty
+   * Y.Text as a minimal prefix/suffix-trimmed diff. The change lands as
+   * granular ops that merge cleanly with concurrent server changes, exactly
+   * like a normal keyboard edit. No-op if the Y.Text already matches disk.
+   */
+  private mergeDiskEdit(doc: Y.Doc, yText: Y.Text, raw: string, docId: string): boolean {
+    const after = injectFrontmatterDocId(raw, docId);
+    const cur = yText.toString();
+    if (cur === after || cur.length === 0) return false;
+    const m = minimalReplace(cur, after);
+    if (!m) return false;
+    doc.transact(() => {
+      if (m.to > m.from) yText.delete(m.from, m.to - m.from);
+      if (m.insert.length > 0) yText.insert(m.from, m.insert);
+    });
+    return true;
+  }
+
+  /**
+   * Debounced trigger for ingesting an external edit of a CLOSED note. Open
+   * notes are handled by Obsidian's own external-merge path plus the
+   * reloadMinimizer, so they are skipped here.
+   */
+  private queueExternalIngest(file: TFile): void {
+    if (this.isFileOpenInEditor(file.path)) return;
+    const path = file.path;
+    const prev = this.externalIngestTimers.get(path);
+    if (prev) clearTimeout(prev);
+    this.externalIngestTimers.set(path, setTimeout(() => {
+      this.externalIngestTimers.delete(path);
+      void this.ingestExternalEdit(path).catch((e) =>
+        console.warn('[cosync] external ingest failed for', path, e));
+    }, EXTERNAL_INGEST_DEBOUNCE_MS));
+  }
+
+  /**
+   * Merge an external (non-editor) change to a closed note into its room. A
+   * fired modify event proves the file genuinely changed on disk, so the disk
+   * content is trusted as the newer version. Uses the live pooled room if
+   * there is one, otherwise a short-lived room (no IndexedDB - the server is
+   * the reference here, and a non-IDB room cannot collide with a user-opened
+   * Y.Doc for the same note).
+   */
+  private async ingestExternalEdit(path: string): Promise<void> {
+    if (this.ingesting.has(path)) return;
+    const af = this.app.vault.getAbstractFileByPath(path);
+    if (!(af instanceof TFile)) return;
+    if (this.isFileOpenInEditor(path)) return;
+
+    let docId: string;
+    try {
+      docId = await this.resolveDocId(af);
+    } catch {
+      return;
+    }
+    const room = this.roomNameFor(docId);
+    // A createRoom for this note is in flight; it reconciles disk itself.
+    if (this.openingRooms.has(room)) return;
+
+    let raw: string;
+    try {
+      raw = await this.app.vault.read(af);
+    } catch {
+      return;
+    }
+
+    const live = this.rooms.get(room);
+    if (live) {
+      this.mergeDiskEdit(live.doc, live.yText, raw, docId);
+      return;
+    }
+
+    const token = effectiveToken(this.settings);
+    if (!token) return;
+    const wsUrl = this.settings.serverUrl.replace(/\/+$/, '');
+
+    this.ingesting.add(path);
+    const doc = new Y.Doc();
+    const yText = doc.getText('cosync');
+    const provider = new WebsocketProvider(wsUrl, room, doc, {
+      params: { token },
+      connect: true,
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('initial sync timeout')), 8000);
+        provider.once('synced', () => { clearTimeout(timer); resolve(); });
+      });
+      const changed = yText.length === 0
+        ? this.seedFromDisk(doc, yText, raw, docId)
+        : this.mergeDiskEdit(doc, yText, raw, docId);
+      if (changed) await new Promise((r) => setTimeout(r, 250)); // flush to server
+    } finally {
+      provider.destroy();
+      doc.destroy();
+      this.ingesting.delete(path);
+    }
   }
 
   /**
@@ -492,9 +625,7 @@ export class SyncManager {
 
       if (yText.length === 0) {
         const raw = await this.app.vault.read(file);
-        if (yText.length === 0) {
-          const seeded = injectFrontmatterDocId(raw, docId);
-          Y.applyUpdate(doc, makeSeedUpdate(seeded));
+        if (this.seedFromDisk(doc, yText, raw, docId)) {
           // Give the provider a beat to flush the update to the server.
           await new Promise((r) => setTimeout(r, 150));
         }
@@ -508,6 +639,9 @@ export class SyncManager {
   /** Tear everything down. Persists a final copy of each room to disk. */
   async closeAll(): Promise<void> {
     this.app.vault.offref(this.renameEventRef);
+    this.app.vault.offref(this.modifyEventRef);
+    for (const t of this.externalIngestTimers.values()) clearTimeout(t);
+    this.externalIngestTimers.clear();
     for (const entry of this.rooms.values()) {
       try {
         if (entry.saveTimer) {
